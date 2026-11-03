@@ -13,9 +13,15 @@ pub struct DecodedImage {
     pub srgb: bool,
 }
 
-/// Decode PNG, JPEG, TGA, TIFF, BMP, WEBP, EXR or HDR bytes.
+/// Most texels [`decode_image`] accepts: 8192 × 8192, the largest texture set resolution
+/// (`texturecraft_core::MAX_RESOLUTION`). Decoded as RGBA f32 that is 1 GiB; a larger
+/// resource adds no detail to any texture set.
+pub const MAX_RESOURCE_TEXELS: u64 = 1 << 26;
+
+/// Decode PNG, JPEG, TGA, TIFF, BMP, WEBP, EXR or HDR bytes of at most
+/// [`MAX_RESOURCE_TEXELS`] texels (refused from the header, before decoding).
 pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage> {
-    decode_image_within(bytes, u64::MAX)
+    decode_image_within(bytes, MAX_RESOURCE_TEXELS)
 }
 
 /// [`decode_image`] for an image of at most `max_texels` (width × height), checked from the
@@ -28,7 +34,7 @@ pub fn decode_image_within(bytes: &[u8], max_texels: u64) -> Result<DecodedImage
         return Err(FormatError::TooLarge(format!("image is {w}x{h} (limit {MAX_IMAGE_SIZE})")));
     }
     if u64::from(w) * u64::from(h) > max_texels {
-        return Err(FormatError::TooLarge(format!("image is {w}x{h}, more than {max_texels} texels")));
+        return Err(FormatError::TooLarge(format!("image is {w}x{h}, more than {max_texels} texels; scale it down and import it again")));
     }
     let img = crate::guard("image", || image::load_from_memory(bytes).map_err(|e| FormatError::Malformed { kind: "image", msg: e.to_string() }))?;
     let srgb = !matches!(img, image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_));
@@ -52,6 +58,31 @@ pub fn coverage_png(width: u32, height: u32, coverage: &[u8], rgb: [u8; 3]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_image_refuses_resources_over_the_texel_cap_from_the_header() {
+        // 8193 × 8192 greyscale: one column over 2^26 texels. Encoded as a PNG this is small;
+        // decoding it would take over 1 GiB.
+        let png = {
+            let mut b = Vec::new();
+            image::GrayImage::new(8193, 8192).write_to(&mut std::io::Cursor::new(&mut b), image::ImageFormat::Png).unwrap();
+            b
+        };
+        assert!(png.len() < 1 << 20, "the test image compresses well ({} bytes)", png.len());
+        assert!(matches!(decode_image(&png), Err(FormatError::TooLarge(_))));
+    }
+
+    #[test]
+    fn decode_image_accepts_a_resource_at_the_cap_edge() {
+        // 2^26 texels exactly, as a 16384 × 4096 strip: the check is on texels, not edge length.
+        let png = {
+            let mut b = Vec::new();
+            image::GrayImage::new(16_384, 4096).write_to(&mut std::io::Cursor::new(&mut b), image::ImageFormat::Png).unwrap();
+            b
+        };
+        let d = decode_image(&png).unwrap();
+        assert_eq!((d.width, d.height), (16_384, 4096));
+    }
 
     #[test]
     fn decodes_png_and_rejects_garbage() {
