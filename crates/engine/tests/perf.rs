@@ -378,6 +378,27 @@ fn baked_data(kind: texturecraft_engine::core::BakedMap, res: u32) -> Vec<f32> {
     out
 }
 
+/// Run `f` while sampling this process's resident set (via `ps`, every 50 ms): returns the result
+/// and the highest sample in MB. Coarse, but it isolates one phase from the rest of the test.
+fn with_peak_rss<T>(f: impl FnOnce() -> T) -> (T, f64) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let pid = std::process::id().to_string();
+    let (stop, peak) = (AtomicBool::new(false), AtomicU64::new(0));
+    std::thread::scope(|sc| {
+        sc.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &pid]).output().ok();
+                let kb = out.and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()).unwrap_or(0);
+                peak.fetch_max(kb, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let r = f();
+        stop.store(true, Ordering::Relaxed);
+        (r, peak.load(Ordering::Relaxed) as f64 / 1024.0)
+    })
+}
+
 #[test]
 #[ignore]
 fn bench_save() {
@@ -387,7 +408,8 @@ fn bench_save() {
     use texturecraft_engine::core::BakedMap;
     const RES: u32 = 4096;
     let mut s = stack(RES);
-    let kinds = [BakedMap::Normal, BakedMap::WorldNormal, BakedMap::Position, BakedMap::AmbientOcclusion, BakedMap::Curvature, BakedMap::Thickness, BakedMap::Id];
+    let kinds =
+        [BakedMap::Normal, BakedMap::WorldNormal, BakedMap::Position, BakedMap::AmbientOcclusion, BakedMap::Curvature, BakedMap::Thickness, BakedMap::Id];
     let maps = kinds.iter().map(|&k| (k, Arc::new(baked_data(k, RES)))).collect();
     s.doc.baked.entry(0).or_default().clone_from(&BakedMaps { resolution: RES, maps });
 
@@ -395,11 +417,13 @@ fn bench_save() {
     let pf = s.project_file();
     println!("[save] project_file: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
     let t = Instant::now();
-    let bytes = texturecraft_engine::formats::save_project_bytes(&pf).unwrap();
-    println!("[save] save_project_bytes: {:.0} ms, file {:.1} MB", t.elapsed().as_secs_f64() * 1e3, mb(bytes.len()));
+    let (_, before_rss) = with_peak_rss(|| std::thread::sleep(Duration::from_millis(150)));
+    println!("[save] RSS before save {before_rss:.0} MB");
+    let (bytes, save_rss) = with_peak_rss(|| texturecraft_engine::formats::save_project_bytes(&pf).unwrap());
+    println!("[save] save_project_bytes: {:.0} ms, file {:.1} MB, peak RSS during save {save_rss:.0} MB", t.elapsed().as_secs_f64() * 1e3, mb(bytes.len()));
     let t = Instant::now();
-    let loaded = texturecraft_engine::formats::load_project_bytes(&bytes).unwrap();
-    println!("[save] load_project_bytes: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    let (loaded, load_rss) = with_peak_rss(|| texturecraft_engine::formats::load_project_bytes(&bytes).unwrap());
+    println!("[save] load_project_bytes: {:.0} ms, peak RSS during load {load_rss:.0} MB", t.elapsed().as_secs_f64() * 1e3);
     assert_eq!(loaded.baked, pf.baked);
 
     let mut zip = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();

@@ -289,7 +289,20 @@ fn baked_v1(w: u32, h: u32, comps: usize, values: &[f32]) -> Vec<u8> {
 #[test]
 fn baked_maps_round_trip_bit_exact() {
     let mut s = sample();
-    let scalar = [0.0, -0.0, f32::MIN_POSITIVE, f32::from_bits(1), f32::from_bits(0x007f_ffff), 1.0e30, 0.999_999_9, 1.000_000_1, -1.0e-30, f32::MAX, f32::NAN, f32::NEG_INFINITY];
+    let scalar = [
+        0.0,
+        -0.0,
+        f32::MIN_POSITIVE,
+        f32::from_bits(1),
+        f32::from_bits(0x007f_ffff),
+        1.0e30,
+        0.999_999_9,
+        1.000_000_1,
+        -1.0e-30,
+        f32::MAX,
+        f32::NAN,
+        f32::NEG_INFINITY,
+    ];
     let ao: Vec<f32> = scalar.iter().cycle().take(4 * 6).copied().collect();
     let normal: Vec<f32> = (0..4 * 6 * 3).map(|i| [i as f32 * 0.37, 1.0 - i as f32 * 1e-7, -(i as f32).sqrt()][i % 3]).collect();
     let baked = BakedMaps { resolution: 4, maps: [(BakedMap::AmbientOcclusion, Arc::new(ao)), (BakedMap::Normal, Arc::new(normal))].into() };

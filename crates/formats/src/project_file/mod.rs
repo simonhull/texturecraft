@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{Cursor, Read, Seek, Write};
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use texturecraft_compose::{BakedMaps, PixelStore};
 use texturecraft_core::{BakedMap, Channel, FORMAT_VERSION, LayerId, Project};
 use texturecraft_texel::{TILE_AREA, TileImage};
@@ -210,61 +211,108 @@ fn unique_entry_name(dir: &str, name: &str, used: &mut HashSet<String>) -> Strin
     entry
 }
 
+/// The content of one deflated entry, borrowed from the [`ProjectFile`] being saved.
+enum Payload<'a> {
+    Bytes(&'a [u8]),
+    Skew(&'a SkewData),
+    Tiles(&'a TileImage),
+    Baked { data: &'a [f32], width: u32, height: u32, comps: usize },
+}
+
+impl Payload<'_> {
+    fn write_to(&self, w: &mut impl Write) -> std::io::Result<()> {
+        match self {
+            Self::Bytes(b) => w.write_all(b),
+            Self::Skew(k) => {
+                let mut b = SKEW_MAGIC.to_vec();
+                b.extend_from_slice(&BIN_VERSION.to_le_bytes());
+                for v in [k.width, k.height] {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                for v in [k.edge_distance, k.edge_contrast] {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                b.push(u8::from(k.per_triangle));
+                w.write_all(&b)?;
+                write_f32s(w, &k.values)
+            }
+            Self::Tiles(img) => write_tiles(w, img),
+            Self::Baked { data, width, height, comps } => {
+                w.write_all(&baked_header(*width, *height, *comps))?;
+                write_baked_planes(w, data, *comps)
+            }
+        }
+    }
+}
+
+fn deflate_options() -> SimpleFileOptions {
+    SimpleFileOptions::default().compression_method(CompressionMethod::Deflated).large_file(true)
+}
+
+/// Compress one entry into a zip of its own, so entries can be deflated on different threads.
+fn compress_entry(name: &str, payload: &Payload<'_>) -> Result<Vec<u8>> {
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    zip.start_file(name, deflate_options()).map_err(zip_err)?;
+    payload.write_to(&mut zip)?;
+    Ok(zip.finish().map_err(zip_err)?.into_inner())
+}
+
+/// Append the single entry of `compressed` (from [`compress_entry`]) without recompressing it.
+fn append_entry<W: Write + Seek>(zip: &mut ZipWriter<W>, compressed: Vec<u8>) -> Result<()> {
+    let mut archive = ZipArchive::new(Cursor::new(compressed)).map_err(zip_err)?;
+    let entry = archive.by_index(0).map_err(zip_err)?;
+    zip.raw_copy_file(entry).map_err(zip_err)
+}
+
 fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
     let mut zip = ZipWriter::new(out);
-    let deflate = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated).large_file(true);
+    let deflate = deflate_options();
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let json = serde_json::to_vec_pretty(&pf.project).map_err(|e| FormatError::Invalid(e.to_string()))?;
     zip.start_file("project.json", deflate).map_err(zip_err)?;
     zip.write_all(&json)?;
+
+    // Every large entry in file order; they are deflated in parallel and appended in this order.
+    let mut entries: Vec<(String, Payload<'_>)> = Vec::new();
     if let Some((ext, bytes)) = &pf.mesh {
-        zip.start_file(format!("mesh.{}", sanitize_ext(ext)), deflate).map_err(zip_err)?;
-        zip.write_all(bytes)?;
+        entries.push((format!("mesh.{}", sanitize_ext(ext)), Payload::Bytes(bytes)));
     }
     let mut used = HashSet::new();
     for (dir, (name, bytes)) in pf.high_poly.iter().map(|m| ("highpoly", m)).chain(pf.cage.iter().map(|m| ("cage", m))) {
-        zip.start_file(unique_entry_name(dir, name, &mut used), deflate).map_err(zip_err)?;
-        zip.write_all(bytes)?;
+        entries.push((unique_entry_name(dir, name, &mut used), Payload::Bytes(bytes)));
     }
     if let Some(k) = pf.skew.as_ref().filter(|k| k.width > 0 && k.height > 0 && k.values.len() as u64 == u64::from(k.width) * u64::from(k.height)) {
-        zip.start_file("skew.bin", deflate).map_err(zip_err)?;
-        let mut b = SKEW_MAGIC.to_vec();
-        b.extend_from_slice(&BIN_VERSION.to_le_bytes());
-        for v in [k.width, k.height] {
-            b.extend_from_slice(&v.to_le_bytes());
-        }
-        for v in [k.edge_distance, k.edge_contrast] {
-            b.extend_from_slice(&v.to_le_bytes());
-        }
-        b.push(u8::from(k.per_triangle));
-        zip.write_all(&b)?;
-        write_f32s(&mut zip, &k.values)?;
+        entries.push(("skew.bin".into(), Payload::Skew(k)));
     }
     let mut layers: Vec<_> = pf.pixels.layers.iter().collect();
     layers.sort_by_key(|(k, _)| **k);
     for ((id, c), img) in layers {
-        zip.start_file(format!("pixels/layer_{}_{}.bin", id.0, c.id()), deflate).map_err(zip_err)?;
-        write_tiles(&mut zip, img)?;
+        entries.push((format!("pixels/layer_{}_{}.bin", id.0, c.id()), Payload::Tiles(img)));
     }
     let mut masks: Vec<_> = pf.pixels.masks.iter().collect();
     masks.sort_by_key(|(k, _)| **k);
     for (id, img) in masks {
-        zip.start_file(format!("pixels/mask_{}.bin", id.0), deflate).map_err(zip_err)?;
-        write_tiles(&mut zip, img)?;
+        entries.push((format!("pixels/mask_{}.bin", id.0), Payload::Tiles(img)));
     }
     for (ts, maps) in &pf.baked {
-        let r = maps.resolution;
+        let width = maps.resolution;
         for (m, data) in &maps.maps {
             // A map whose size disagrees with its width cannot be loaded; it can be re-baked.
-            let h = maps.height(*m);
-            if h == 0 || data.len() != (r as usize) * (h as usize) * m.components() {
+            let height = maps.height(*m);
+            if height == 0 || data.len() != (width as usize) * (height as usize) * m.components() {
                 continue;
             }
-            zip.start_file(format!("baked/{ts}_{}.bin", m.id()), deflate).map_err(zip_err)?;
-            zip.write_all(&baked_header(r, h, m.components()))?;
-            write_baked_planes(&mut zip, data, m.components())?;
+            entries.push((format!("baked/{ts}_{}.bin", m.id()), Payload::Baked { data, width, height, comps: m.components() }));
         }
     }
+    // Batches of one entry per thread bound how many compressed entries are held at once.
+    for batch in entries.chunks(rayon::current_num_threads().max(1)) {
+        let compressed = batch.par_iter().map(|(name, payload)| compress_entry(name, payload)).collect::<Result<Vec<_>>>()?;
+        for entry in compressed {
+            append_entry(&mut zip, entry)?;
+        }
+    }
+
     if let Some(png) = &pf.thumbnail {
         zip.start_file("thumbnail.png", stored).map_err(zip_err)?;
         zip.write_all(png)?;
@@ -424,7 +472,8 @@ fn read_baked_planes(r: &mut impl Read, texels: usize, comps: usize, what: &str)
                 let bytes = buf.get_mut(..n).ok_or_else(|| malformed(KIND, format!("{what}: internal buffer")))?;
                 read_exact(r, bytes, what)?;
                 if c == 0 && byte == 0 {
-                    bits.try_reserve((done + n) * comps - bits.len()).map_err(|_| FormatError::TooLarge(format!("{what}: not enough memory for {texels} texels")))?;
+                    bits.try_reserve((done + n) * comps - bits.len())
+                        .map_err(|_| FormatError::TooLarge(format!("{what}: not enough memory for {texels} texels")))?;
                     bits.resize((done + n) * comps, 0);
                 }
                 let dst = bits.get_mut(done * comps..(done + n) * comps).ok_or_else(|| malformed(KIND, format!("{what}: internal buffer")))?;
