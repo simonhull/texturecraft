@@ -238,12 +238,14 @@ fn a_skew_header_cannot_claim_more_than_the_entry_holds() {
 }
 
 #[test]
-fn a_truncated_baked_map_is_an_error_not_a_huge_allocation() {
-    // The header agrees with a padded entry, but the data is cut short: reading must fail on
-    // the missing bytes, having grown by at most one chunk.
+fn a_baked_map_entry_shorter_than_its_header_is_malformed() {
+    // The header claims 4096 × 4096 but the entry holds only 1000 data bytes: the declared entry
+    // size disagrees with the header, so it is rejected before any data is read.
     let m = BakedMap::AmbientOcclusion;
     let mut entry = header(4096, 4096, m.components(), 0);
     entry.extend(vec![0u8; 1000]);
     let bytes = zip_with(&[(&format!("baked/0_{}.bin", m.id()), entry)]);
-    assert!(load_project_bytes(&bytes).is_err());
+    let e = load_project_bytes(&bytes).unwrap_err();
+    assert!(!is_guard_error(&e), "{e}");
+    assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
 }
