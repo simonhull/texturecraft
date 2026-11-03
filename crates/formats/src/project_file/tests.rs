@@ -211,3 +211,39 @@ fn duplicate_entry_names_are_made_unique_on_save() {
     res.sort();
     assert_eq!(res, vec![vec![3], vec![4]]);
 }
+
+#[test]
+fn a_baked_map_header_cannot_claim_more_than_the_entry_holds() {
+    let m = BakedMap::AmbientOcclusion;
+    // Claims 16384 × 16384 (2^28 texels, the largest accepted) but holds 8 bytes of data.
+    let mut entry = header(16_384, 16_384, m.components(), 0);
+    entry.extend([0u8; 8]);
+    let bytes = zip_with(&[(&format!("baked/0_{}.bin", m.id()), entry)]);
+    let e = load_project_bytes(&bytes).unwrap_err();
+    assert!(!is_guard_error(&e), "{e}");
+    assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
+}
+
+#[test]
+fn a_skew_header_cannot_claim_more_than_the_entry_holds() {
+    let mut entry = SKEW_MAGIC.to_vec();
+    for v in [BIN_VERSION, 16_384, 16_384, 0, 0] {
+        entry.extend(v.to_le_bytes());
+    }
+    entry.push(0); // per-triangle flag
+    entry.extend([0u8; 8]);
+    let bytes = zip_with(&[("skew.bin", entry)]);
+    let e = load_project_bytes(&bytes).unwrap_err();
+    assert!(!is_guard_error(&e), "{e}");
+}
+
+#[test]
+fn a_truncated_baked_map_is_an_error_not_a_huge_allocation() {
+    // The header agrees with a padded entry, but the data is cut short: reading must fail on
+    // the missing bytes, having grown by at most one chunk.
+    let m = BakedMap::AmbientOcclusion;
+    let mut entry = header(4096, 4096, m.components(), 0);
+    entry.extend(vec![0u8; 1000]);
+    let bytes = zip_with(&[(&format!("baked/0_{}.bin", m.id()), entry)]);
+    assert!(load_project_bytes(&bytes).is_err());
+}
