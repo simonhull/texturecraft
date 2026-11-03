@@ -235,6 +235,7 @@ fn a_skew_header_cannot_claim_more_than_the_entry_holds() {
     let bytes = zip_with(&[("skew.bin", entry)]);
     let e = load_project_bytes(&bytes).unwrap_err();
     assert!(!is_guard_error(&e), "{e}");
+    assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
 }
 
 #[test]
@@ -245,6 +246,34 @@ fn a_baked_map_entry_shorter_than_its_header_is_malformed() {
     let mut entry = header(4096, 4096, m.components(), 0);
     entry.extend(vec![0u8; 1000]);
     let bytes = zip_with(&[(&format!("baked/0_{}.bin", m.id()), entry)]);
+    let e = load_project_bytes(&bytes).unwrap_err();
+    assert!(!is_guard_error(&e), "{e}");
+    assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
+}
+
+/// Overwrite the uncompressed size recorded for `name` in both the central-directory record and
+/// the local file header of a zip, leaving the stored data untouched.
+fn forge_uncompressed_size(zip: &mut [u8], name: &str, size: u32) {
+    let find = |sig: &[u8], name_at: usize| {
+        (0..zip.len().saturating_sub(name_at + name.len()))
+            .find(|&i| zip[i..].starts_with(sig) && &zip[i + name_at..i + name_at + name.len()] == name.as_bytes())
+            .expect("entry record present")
+    };
+    let central = find(b"PK\x01\x02", 46);
+    let local = find(b"PK\x03\x04", 30);
+    zip[central + 24..central + 28].copy_from_slice(&size.to_le_bytes());
+    zip[local + 22..local + 26].copy_from_slice(&size.to_le_bytes());
+}
+
+#[test]
+fn a_baked_map_with_matching_declared_size_but_truncated_payload_is_malformed() {
+    // The entry holds a valid header and no texel data, but its recorded size is patched to the full
+    // expected `24 + 4 * comps`: the size check passes, so only the short read can reject it.
+    let m = BakedMap::AmbientOcclusion;
+    let name = format!("baked/0_{}.bin", m.id());
+    let mut bytes = zip_with(&[(&name, header(1, 1, m.components(), 0))]);
+    let full = u32::try_from(24 + 4 * m.components()).unwrap();
+    forge_uncompressed_size(&mut bytes, &name, full);
     let e = load_project_bytes(&bytes).unwrap_err();
     assert!(!is_guard_error(&e), "{e}");
     assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
