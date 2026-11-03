@@ -15,7 +15,10 @@
 //! Pixel `.bin` files are sparse and lossless: a header (magic `TCTX`, version, width, height,
 //! components, tile count; u32 LE each) followed, for every allocated 64×64 tile, by `tx`, `ty`
 //! (u32 LE) and the tile's raw `u16` LE components. Baked maps use the same header with a tile
-//! count of 0, followed by `width × height × components` f32 LE. Pixels of a UV-tiled texture
+//! count of 0. Baked maps are version 2: for each component, four byte planes (every texel's
+//! byte 0 of the f32 LE, then byte 1, 2 and 3), which deflate compresses far better. Version 1
+//! baked maps (`width × height × components` interleaved f32 LE) are still read. Pixels of a
+//! UV-tiled texture
 //! set cover its whole atlas (`resolution` per tile, see `TileGrid`).
 
 use std::collections::{BTreeMap, HashSet};
@@ -34,6 +37,11 @@ const KIND: &str = "project file";
 const MAGIC: &[u8; 4] = b"TCTX";
 /// Version of the `.bin` layout.
 const BIN_VERSION: u32 = 1;
+/// Version of the baked-map layout: per-component planes of byte-shuffled f32s (version 1 is the
+/// interleaved f32 layout, still read).
+const BAKED_VERSION: u32 = 2;
+/// Floats per buffered write: 64 KiB.
+const WRITE_CHUNK: usize = 16 * 1024;
 const SKEW_MAGIC: &[u8; 4] = b"TCSK";
 const MAX_JSON: u64 = 256 << 20;
 const MAX_THUMBNAIL: u64 = 64 << 20;
@@ -131,6 +139,40 @@ fn header(w: u32, h: u32, comps: usize, count: usize) -> Vec<u8> {
     b
 }
 
+fn baked_header(w: u32, h: u32, comps: usize) -> Vec<u8> {
+    let mut b = header(w, h, comps, 0);
+    b.splice(4..8, BAKED_VERSION.to_le_bytes());
+    b
+}
+
+/// Write a baked map's `comps`-interleaved f32s as byte planes: for each component, the lowest
+/// byte of every texel's value, then the next byte, and so on. Smooth data has near-constant
+/// exponent bytes, which deflate then finds. Bit-exact; streams through a bounded buffer.
+fn write_baked_planes(w: &mut impl Write, data: &[f32], comps: usize) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(WRITE_CHUNK);
+    for c in 0..comps {
+        for byte in 0..4 {
+            for chunk in data.chunks(WRITE_CHUNK * comps) {
+                buf.clear();
+                buf.extend(chunk.iter().skip(c).step_by(comps).map(|v| v.to_le_bytes()[byte]));
+                w.write_all(&buf)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write `values` as little-endian f32 through a bounded buffer (no full-size copy).
+fn write_f32s(w: &mut impl Write, values: &[f32]) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(WRITE_CHUNK * 4);
+    for chunk in values.chunks(WRITE_CHUNK) {
+        buf.clear();
+        buf.extend(chunk.iter().flat_map(|v| v.to_le_bytes()));
+        w.write_all(&buf)?;
+    }
+    Ok(())
+}
+
 fn write_tiles(w: &mut impl Write, img: &TileImage) -> std::io::Result<()> {
     w.write_all(&header(img.width(), img.height(), img.comps(), img.allocated_count()))?;
     let mut buf = Vec::with_capacity(TILE_AREA * img.comps() * 2 + 8);
@@ -195,8 +237,8 @@ fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
             b.extend_from_slice(&v.to_le_bytes());
         }
         b.push(u8::from(k.per_triangle));
-        b.extend(k.values.iter().flat_map(|v| v.to_le_bytes()));
         zip.write_all(&b)?;
+        write_f32s(&mut zip, &k.values)?;
     }
     let mut layers: Vec<_> = pf.pixels.layers.iter().collect();
     layers.sort_by_key(|(k, _)| **k);
@@ -219,9 +261,8 @@ fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
                 continue;
             }
             zip.start_file(format!("baked/{ts}_{}.bin", m.id()), deflate).map_err(zip_err)?;
-            zip.write_all(&header(r, h, m.components(), 0))?;
-            let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-            zip.write_all(&bytes)?;
+            zip.write_all(&baked_header(r, h, m.components()))?;
+            write_baked_planes(&mut zip, data, m.components())?;
         }
     }
     if let Some(png) = &pf.thumbnail {
@@ -299,18 +340,19 @@ fn u32_at(b: &[u8], i: usize) -> u32 {
     b.get(i * 4..i * 4 + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]])).unwrap_or(0)
 }
 
-/// Read and check a `.bin` header: returns (width, height, comps, count).
-fn read_header(r: &mut impl Read, what: &str) -> Result<(u32, u32, usize, usize)> {
+/// Read and check a `.bin` header, refusing versions above `max_version`: returns (version,
+/// width, height, comps, count).
+fn read_header(r: &mut impl Read, what: &str, max_version: u32) -> Result<(u32, u32, u32, usize, usize)> {
     let mut h = [0u8; 24];
     read_exact(r, &mut h, what)?;
     if h.get(..4) != Some(MAGIC.as_slice()) {
         return Err(malformed(KIND, format!("{what}: bad magic")));
     }
     let v = u32_at(&h, 1);
-    if v > BIN_VERSION {
-        return Err(FormatError::NewerVersion { found: v, supported: BIN_VERSION });
+    if v > max_version {
+        return Err(FormatError::NewerVersion { found: v, supported: max_version });
     }
-    Ok((u32_at(&h, 2), u32_at(&h, 3), u32_at(&h, 4) as usize, u32_at(&h, 5) as usize))
+    Ok((v, u32_at(&h, 2), u32_at(&h, 3), u32_at(&h, 4) as usize, u32_at(&h, 5) as usize))
 }
 
 /// Error unless the entry has no bytes left (also makes the zip reader verify the CRC).
@@ -324,7 +366,7 @@ fn expect_end(r: &mut impl Read, what: &str) -> Result<()> {
 }
 
 fn read_tiles(r: &mut impl Read, size: (u32, u32), comps: usize, budget: &mut Budget, what: &str) -> Result<TileImage> {
-    let (w, h, c, count) = read_header(r, what)?;
+    let (_, w, h, c, count) = read_header(r, what, BIN_VERSION)?;
     if (w, h) != size || c != comps {
         return Err(malformed(KIND, format!("{what}: {w}×{h}×{c} does not match the texture set ({}×{}×{comps})", size.0, size.1)));
     }
@@ -351,7 +393,7 @@ fn read_tiles(r: &mut impl Read, size: (u32, u32), comps: usize, budget: &mut Bu
 
 /// A baked map: (width, height, data).
 fn read_baked(r: &mut impl Read, declared: u64, comps: usize, budget: &mut Budget, what: &str) -> Result<(u32, u32, Vec<f32>)> {
-    let (w, h, c, _) = read_header(r, what)?;
+    let (version, w, h, c, _) = read_header(r, what, BAKED_VERSION)?;
     if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_TEXELS || c != comps {
         return Err(malformed(KIND, format!("{what}: bad size {w}×{h}×{c}")));
     }
@@ -361,9 +403,39 @@ fn read_baked(r: &mut impl Read, declared: u64, comps: usize, budget: &mut Budge
         return Err(malformed(KIND, format!("{what}: {declared} bytes for a {w}×{h}×{c} map")));
     }
     budget.take(len as u64 * 4)?;
-    let data = read_f32s(r, len, what)?;
+    let data = if version >= 2 { read_baked_planes(r, len / comps, comps, what)? } else { read_f32s(r, len, what)? };
     expect_end(r, what)?;
     Ok((w, h, data))
+}
+
+/// Read the byte planes written by [`write_baked_planes`] back into interleaved f32s. The output
+/// grows with the first plane's bytes as they arrive (never from the header), then later planes
+/// fill it in place.
+fn read_baked_planes(r: &mut impl Read, texels: usize, comps: usize, what: &str) -> Result<Vec<f32>> {
+    const CHUNK: usize = 1 << 18; // texels per read: 256 KiB
+    let mut bits: Vec<u32> = Vec::new();
+    let mut buf = vec![0u8; CHUNK.min(texels)];
+    for c in 0..comps {
+        for byte in 0..4 {
+            let shift = byte * 8;
+            let mut done = 0;
+            while done < texels {
+                let n = CHUNK.min(texels - done);
+                let bytes = buf.get_mut(..n).ok_or_else(|| malformed(KIND, format!("{what}: internal buffer")))?;
+                read_exact(r, bytes, what)?;
+                if c == 0 && byte == 0 {
+                    bits.try_reserve((done + n) * comps - bits.len()).map_err(|_| FormatError::TooLarge(format!("{what}: not enough memory for {texels} texels")))?;
+                    bits.resize((done + n) * comps, 0);
+                }
+                let dst = bits.get_mut(done * comps..(done + n) * comps).ok_or_else(|| malformed(KIND, format!("{what}: internal buffer")))?;
+                for (d, b) in dst.iter_mut().skip(c).step_by(comps).zip(bytes.iter()) {
+                    *d |= u32::from(*b) << shift;
+                }
+                done += n;
+            }
+        }
+    }
+    Ok(bits.into_iter().map(f32::from_bits).collect())
 }
 
 /// The skew map entry: header, then the values.

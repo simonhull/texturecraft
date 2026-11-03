@@ -350,3 +350,63 @@ fn bench_8k_resize() {
     println!("[resize] dilation {:.2?}", t.elapsed());
     drop(d);
 }
+
+/// Smooth, realistic data for a baked map of `comps` components: normals vary slowly, AO is a
+/// low-frequency sine product, Id has a few flat regions and Position is a linear ramp.
+fn baked_data(kind: texturecraft_engine::core::BakedMap, res: u32) -> Vec<f32> {
+    use texturecraft_engine::core::BakedMap;
+    let n = res as usize;
+    let mut out = Vec::with_capacity(n * n * kind.components());
+    for y in 0..n {
+        for x in 0..n {
+            let (u, v) = (x as f32 / n as f32, y as f32 / n as f32);
+            match kind {
+                BakedMap::Normal | BakedMap::WorldNormal => {
+                    let (a, b) = ((u * 3.0).sin() * 0.4, (v * 2.0).cos() * 0.4);
+                    let c = (1.0 - a * a - b * b).max(0.0).sqrt();
+                    out.extend([a * 0.5 + 0.5, b * 0.5 + 0.5, c * 0.5 + 0.5]);
+                }
+                BakedMap::Position => out.extend([u, v, (u + v) * 0.5]),
+                BakedMap::Id => {
+                    let region = ((x * 4 / n) + (y * 4 / n)) as f32;
+                    out.extend([region / 8.0, (region * 0.37).fract(), (region * 0.73).fract()]);
+                }
+                _ => out.push(0.5 + 0.5 * (u * 9.0).sin() * (v * 7.0).sin()),
+            }
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore]
+fn bench_save() {
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use texturecraft_engine::compose::BakedMaps;
+    use texturecraft_engine::core::BakedMap;
+    const RES: u32 = 4096;
+    let mut s = stack(RES);
+    let kinds = [BakedMap::Normal, BakedMap::WorldNormal, BakedMap::Position, BakedMap::AmbientOcclusion, BakedMap::Curvature, BakedMap::Thickness, BakedMap::Id];
+    let maps = kinds.iter().map(|&k| (k, Arc::new(baked_data(k, RES)))).collect();
+    s.doc.baked.entry(0).or_default().clone_from(&BakedMaps { resolution: RES, maps });
+
+    let t = Instant::now();
+    let pf = s.project_file();
+    println!("[save] project_file: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    let t = Instant::now();
+    let bytes = texturecraft_engine::formats::save_project_bytes(&pf).unwrap();
+    println!("[save] save_project_bytes: {:.0} ms, file {:.1} MB", t.elapsed().as_secs_f64() * 1e3, mb(bytes.len()));
+    let t = Instant::now();
+    let loaded = texturecraft_engine::formats::load_project_bytes(&bytes).unwrap();
+    println!("[save] load_project_bytes: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    assert_eq!(loaded.baked, pf.baked);
+
+    let mut zip = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+    let (mut baked, mut other) = (0u64, 0u64);
+    for i in 0..zip.len() {
+        let f = zip.by_index(i).unwrap();
+        if f.name().unwrap().starts_with("baked/") { baked += f.compressed_size() } else { other += f.compressed_size() }
+    }
+    println!("[save] baked entries: {:.1} MB, other entries: {:.1} MB", mb(baked as usize), mb(other as usize));
+}

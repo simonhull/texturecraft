@@ -278,3 +278,65 @@ fn a_baked_map_with_matching_declared_size_but_truncated_payload_is_malformed() 
     assert!(!is_guard_error(&e), "{e}");
     assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
 }
+
+/// The version 1 layout: the baked header, then interleaved f32 LE.
+fn baked_v1(w: u32, h: u32, comps: usize, values: &[f32]) -> Vec<u8> {
+    let mut b = header(w, h, comps, 0);
+    b.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+    b
+}
+
+#[test]
+fn baked_maps_round_trip_bit_exact() {
+    let mut s = sample();
+    let scalar = [0.0, -0.0, f32::MIN_POSITIVE, f32::from_bits(1), f32::from_bits(0x007f_ffff), 1.0e30, 0.999_999_9, 1.000_000_1, -1.0e-30, f32::MAX, f32::NAN, f32::NEG_INFINITY];
+    let ao: Vec<f32> = scalar.iter().cycle().take(4 * 6).copied().collect();
+    let normal: Vec<f32> = (0..4 * 6 * 3).map(|i| [i as f32 * 0.37, 1.0 - i as f32 * 1e-7, -(i as f32).sqrt()][i % 3]).collect();
+    let baked = BakedMaps { resolution: 4, maps: [(BakedMap::AmbientOcclusion, Arc::new(ao)), (BakedMap::Normal, Arc::new(normal))].into() };
+    s.pf.baked = [(0, baked.clone())].into();
+    let back = load_project_bytes(&save_project_bytes(&s.pf).unwrap()).unwrap();
+    let got = &back.baked[&0];
+    assert_eq!((got.resolution, got.maps.len()), (4, 2));
+    for (m, want) in &baked.maps {
+        let have = &got.maps[m];
+        assert_eq!(have.len(), want.len());
+        assert!(have.iter().zip(want.iter()).all(|(a, b)| a.to_bits() == b.to_bits()), "{m:?} differs");
+    }
+}
+
+#[test]
+fn version_1_baked_maps_still_load() {
+    let ao: Vec<f32> = (0..16).map(|i| i as f32 * 0.25 - 1.0).collect();
+    let normal: Vec<f32> = (0..4 * 4 * 3).map(|i| i as f32 / 7.0).collect();
+    let bytes = zip_with(&[
+        (&format!("baked/0_{}.bin", BakedMap::AmbientOcclusion.id()), baked_v1(4, 4, 1, &ao)),
+        (&format!("baked/0_{}.bin", BakedMap::Normal.id()), baked_v1(4, 4, 3, &normal)),
+    ]);
+    let pf = load_project_bytes(&bytes).unwrap();
+    let maps = &pf.baked[&0];
+    assert_eq!(maps.resolution, 4);
+    assert_eq!(*maps.maps[&BakedMap::AmbientOcclusion], ao);
+    assert_eq!(*maps.maps[&BakedMap::Normal], normal);
+}
+
+#[test]
+fn newer_baked_version_is_refused() {
+    let mut b = baked_v1(2, 2, 1, &[0.0; 4]);
+    b.splice(4..8, 3u32.to_le_bytes());
+    let bytes = zip_with(&[(&format!("baked/0_{}.bin", BakedMap::AmbientOcclusion.id()), b)]);
+    assert!(matches!(load_project_bytes(&bytes), Err(FormatError::NewerVersion { found: 3, supported: 2 })));
+}
+
+#[test]
+fn truncated_version_2_baked_map_is_an_error() {
+    let mut s = sample();
+    s.pf.baked = [(0, BakedMaps { resolution: 4, maps: [(BakedMap::Normal, Arc::new(vec![0.5; 4 * 4 * 3]))].into() })].into();
+    let full = save_project_bytes(&s.pf).unwrap();
+    let back = load_project_bytes(&full).unwrap();
+    assert_eq!(back.baked[&0].maps.len(), 1);
+    // A plane entry cut short: header says 4×4×3 but only part of the planes follow.
+    let mut b = baked_header(4, 4, 3);
+    b.extend(vec![0u8; 4 * 4 * 3 * 4 - 5]);
+    let bytes = zip_with(&[(&format!("baked/0_{}.bin", BakedMap::Normal.id()), b)]);
+    assert!(load_project_bytes(&bytes).is_err());
+}
