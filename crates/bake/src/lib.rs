@@ -40,8 +40,12 @@ pub const MAX_TEXELS: u64 = 1 << 27;
 // Bound each supersampled G-buffer to roughly 200 MB
 const STRIP_TEXELS: usize = 1 << 24;
 const BATCH: usize = 1 << 18;
+// Antialiased batches cover up to 2^18 texels in at most this many subsamples
+const AA_BATCH: usize = 1 << 20;
 // Curvature batches stay small so progress and cancellation remain responsive
 const CURVATURE_BATCH: usize = 1 << 15;
+// Subsamples per parallel span of a batch (see `span_texels`)
+const SPAN_SAMPLES: usize = 1 << 12;
 
 fn validate(request: &BakeRequest) -> Result<(), BakeError> {
     let settings = request.settings;
@@ -188,7 +192,12 @@ fn bake_in_strips(request: &BakeRequest, progress: &Progress, strip_texels: usiz
 
     let (sample_width, sample_height) = (width * samples_per_axis, height * samples_per_axis);
     let rows_per_strip = (strip_texels / (sample_width * samples_per_axis)).max(1).min(height);
-    let batch = if context.traces_curvature() { CURVATURE_BATCH } else { BATCH };
+    let batch = match context.traces_curvature() {
+        true => CURVATURE_BATCH,
+        // Antialiased texels split their rays between subsamples: batch as many texels as without
+        // antialiasing (up to AA_BATCH subsamples), or each batch holds too little GPU work
+        false => BATCH.saturating_mul(samples_per_axis.saturating_mul(samples_per_axis)).min(AA_BATCH),
+    };
     let rows_per_batch = (batch / (sample_width * samples_per_axis)).max(1);
     let mut strip_mesh = Mesh { indices: request.mesh.indices.clone(), submeshes: request.mesh.submeshes.clone(), ..Mesh::default() };
     for strip_start in (0..height).step_by(rows_per_strip) {
@@ -281,6 +290,21 @@ fn bake_in_strips(request: &BakeRequest, progress: &Progress, strip_texels: usiz
     Ok(BakeOutput { resolution: width as u32, height: height as u32, maps: output, tracer: tracer.name() })
 }
 
+/// A run of texels in one row of a batch, the unit of parallel work in [`bake_rows`].
+struct Span {
+    row: usize,
+    /// First texel of the span in its row.
+    x: usize,
+    /// Its texels.
+    width: usize,
+}
+
+/// The texels of each parallel span: whole rows without antialiasing, shorter runs with it, so a
+/// batch of only a few supersampled rows still spreads over every core.
+fn span_texels(samples_per_axis: usize) -> usize {
+    (SPAN_SAMPLES / samples_per_axis.saturating_mul(samples_per_axis).max(1)).max(1)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bake_rows(
     context: &map::BakeContext,
@@ -293,10 +317,15 @@ fn bake_rows(
     (width, samples_per_axis, first_texel_seed): (usize, usize, usize),
 ) -> Result<(), BakeError> {
     let sample_width = width * samples_per_axis;
-    let samples_by_row: Vec<Vec<map::Sample>> = (first_row..first_row + rows.len())
-        .into_par_iter()
-        .map(|row| {
-            let subsamples = (0..width).flat_map(|x| {
+    let span_width = span_texels(samples_per_axis);
+    let spans: Vec<Span> = (first_row..first_row + rows.len())
+        .flat_map(|row| (0..width).step_by(span_width).map(move |x| Span { row, x, width: span_width.min(width - x) }))
+        .collect();
+    let samples_by_span: Vec<Vec<map::Sample>> = spans
+        .par_iter()
+        .map(|span| {
+            let row = span.row;
+            let subsamples = (span.x..span.x + span.width).flat_map(|x| {
                 (0..samples_per_axis * samples_per_axis).map(move |sample_index| {
                     (x, (row * samples_per_axis + sample_index / samples_per_axis) * sample_width + x * samples_per_axis + sample_index % samples_per_axis)
                 })
@@ -323,14 +352,14 @@ fn bake_rows(
             samples
         })
         .collect();
-    let row_offsets: Vec<usize> = samples_by_row
+    let span_offsets: Vec<usize> = samples_by_span
         .iter()
-        .scan(0, |sample_count, row| {
-            *sample_count += row.len();
-            Some(*sample_count - row.len())
+        .scan(0, |sample_count, span| {
+            *sample_count += span.len();
+            Some(*sample_count - span.len())
         })
         .collect();
-    let samples = || samples_by_row.par_iter().flat_map_iter(|row| row.iter());
+    let samples = || samples_by_span.par_iter().flat_map_iter(|span| span.iter());
 
     let transfers = match context.has_high() {
         true => {
@@ -343,10 +372,10 @@ fn bake_rows(
     let transfer = |sample_index: usize| transfers.get(sample_index).and_then(Option::as_ref);
     let curvature = match context.traces_curvature() {
         true => {
-            let items: Vec<(&Surface, Option<&map::Transfer>)> = samples_by_row
+            let items: Vec<(&Surface, Option<&map::Transfer>)> = samples_by_span
                 .iter()
-                .zip(&row_offsets)
-                .flat_map(|(row, &first)| row.iter().zip(first..))
+                .zip(&span_offsets)
+                .flat_map(|(span, &first)| span.iter().zip(first..))
                 .map(|(sample, sample_index)| (&sample.surface, transfer(sample_index)))
                 .collect();
             context.trace_curvature(scene, &items)?
@@ -354,10 +383,10 @@ fn bake_rows(
         false => Vec::new(),
     };
     let queries: Vec<tracing::Query> = match context.ao.is_some() || context.bent.is_some() || context.thickness.is_some() {
-        true => samples_by_row
+        true => samples_by_span
             .par_iter()
-            .zip(&row_offsets)
-            .flat_map_iter(|(row, &first)| row.iter().zip(first..))
+            .zip(&span_offsets)
+            .flat_map_iter(|(span, &first)| span.iter().zip(first..))
             .map(|(sample, sample_index)| context.query(transfer(sample_index), &sample.surface, sample.seed, (sample.subset, sample.subsets)))
             .collect(),
         false => Vec::new(),
@@ -371,17 +400,25 @@ fn bake_rows(
         (next(context.ao.is_some()), next(separate_bent_pass.is_some()), next(context.thickness.is_some()));
     let bent_results = if separate_bent_pass.is_some() { &separate_bent_results } else { &occlusion_results };
 
-    rows.par_iter_mut().zip(&samples_by_row).zip(&row_offsets).for_each(|((row, samples), &first)| {
+    // Each span's slice of every map, in span order
+    let mut outputs: Vec<OutRow> = Vec::with_capacity(spans.len());
+    for row in rows.iter_mut() {
+        let mut pieces: Vec<_> = row.iter_mut().zip(maps).map(|(data, map)| data.chunks_mut(span_width * map.components())).collect();
+        for _ in 0..width.div_ceil(span_width) {
+            outputs.push(pieces.iter_mut().filter_map(Iterator::next).collect());
+        }
+    }
+    outputs.par_iter_mut().zip(&spans).zip(&samples_by_span).zip(&span_offsets).for_each(|(((output, span), samples), &first)| {
         let mut sample_values = [[0.0f32; 3]; BakedMap::ALL.len()];
-        let mut row_sample_index = 0;
-        for x in 0..width {
-            let texel_samples = samples.get(row_sample_index..).unwrap_or_default().iter().take_while(|sample| sample.x == x).count();
-            let bent = texel_bent_normal(bent_results, first + row_sample_index..first + row_sample_index + texel_samples);
+        let mut span_sample_index = 0;
+        for x in span.x..span.x + span.width {
+            let texel_samples = samples.get(span_sample_index..).unwrap_or_default().iter().take_while(|sample| sample.x == x).count();
+            let bent = texel_bent_normal(bent_results, first + span_sample_index..first + span_sample_index + texel_samples);
             // Per map: a subsample without a finite value (a ray subset with no accepted ray) is skipped
             let mut accumulated = [[0.0f32; 3]; BakedMap::ALL.len()];
             let mut counts = [0u32; BakedMap::ALL.len()];
-            while let Some(sample) = samples.get(row_sample_index).filter(|sample| sample.x == x) {
-                let sample_index = first + row_sample_index;
+            while let Some(sample) = samples.get(span_sample_index).filter(|sample| sample.x == x) {
+                let sample_index = first + span_sample_index;
                 let traced = map::Traced {
                     ao: occlusion_results.get(sample_index).map_or(1.0, |value| value[0]),
                     bent,
@@ -395,14 +432,15 @@ fn bake_rows(
                         *count += 1;
                     }
                 }
-                row_sample_index += 1;
+                span_sample_index += 1;
             }
 
-            for (((map, destination), sum), &count) in maps.iter().zip(row.iter_mut()).zip(&accumulated).zip(&counts) {
+            let texel = x - span.x;
+            for (((map, destination), sum), &count) in maps.iter().zip(output.iter_mut()).zip(&accumulated).zip(&counts) {
                 let component_count = map.components();
                 let mean = sum.map(|sum| sum / count.max(1) as f32);
                 let value = if count == 0 || mean.iter().any(|value| !value.is_finite()) { map.neutral() } else { mean };
-                if let Some(pixel) = destination.get_mut(x * component_count..(x + 1) * component_count) {
+                if let Some(pixel) = destination.get_mut(texel * component_count..(texel + 1) * component_count) {
                     pixel.iter_mut().zip(value).for_each(|(component, value)| *component = value);
                 }
             }
