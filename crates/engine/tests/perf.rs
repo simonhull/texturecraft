@@ -383,6 +383,13 @@ fn baked_data(kind: texturecraft_engine::core::BakedMap, res: u32) -> Vec<f32> {
 fn with_peak_rss<T>(f: impl FnOnce() -> T) -> (T, f64) {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     let pid = std::process::id().to_string();
+    /// Stops the sampler on drop, so a panic in `f` cannot leave the scope joining a live thread.
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
     let (stop, peak) = (AtomicBool::new(false), AtomicU64::new(0));
     std::thread::scope(|sc| {
         sc.spawn(|| {
@@ -393,8 +400,9 @@ fn with_peak_rss<T>(f: impl FnOnce() -> T) -> (T, f64) {
                 std::thread::sleep(Duration::from_millis(50));
             }
         });
+        let guard = Stop(&stop);
         let r = f();
-        stop.store(true, Ordering::Relaxed);
+        drop(guard);
         (r, peak.load(Ordering::Relaxed) as f64 / 1024.0)
     })
 }
@@ -416,9 +424,9 @@ fn bench_save() {
     let t = Instant::now();
     let pf = s.project_file();
     println!("[save] project_file: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
-    let t = Instant::now();
     let (_, before_rss) = with_peak_rss(|| std::thread::sleep(Duration::from_millis(150)));
     println!("[save] RSS before save {before_rss:.0} MB");
+    let t = Instant::now();
     let (bytes, save_rss) = with_peak_rss(|| texturecraft_engine::formats::save_project_bytes(&pf).unwrap());
     println!("[save] save_project_bytes: {:.0} ms, file {:.1} MB, peak RSS during save {save_rss:.0} MB", t.elapsed().as_secs_f64() * 1e3, mb(bytes.len()));
     let t = Instant::now();

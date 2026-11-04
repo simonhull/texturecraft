@@ -350,6 +350,12 @@ fn truncated_version_2_baked_map_is_an_error() {
     // A plane entry cut short: header says 4×4×3 but only part of the planes follow.
     let mut b = baked_header(4, 4, 3);
     b.extend(vec![0u8; 4 * 4 * 3 * 4 - 5]);
-    let bytes = zip_with(&[(&format!("baked/0_{}.bin", BakedMap::Normal.id()), b)]);
-    assert!(load_project_bytes(&bytes).is_err());
+    let name = format!("baked/0_{}.bin", BakedMap::Normal.id());
+    let mut bytes = zip_with(&[(&name, b)]);
+    // Declare the full size (24-byte header + 4×4×3 f32s) so the declared-size check passes and
+    // the version-2 plane reader is what hits the missing bytes.
+    forge_uncompressed_size(&mut bytes, &name, 24 + 4 * 4 * 3 * 4);
+    let e = load_project_bytes(&bytes).unwrap_err();
+    assert!(!is_guard_error(&e), "{e}");
+    assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
 }
