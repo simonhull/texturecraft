@@ -27,6 +27,18 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage> {
 /// [`decode_image`] for an image of at most `max_texels` (width × height), checked from the
 /// header, before any pixel is decoded or allocated.
 pub fn decode_image_within(bytes: &[u8], max_texels: u64) -> Result<DecodedImage> {
+    header_dimensions_within(bytes, max_texels)?;
+    let img = crate::guard("image", || image::load_from_memory(bytes).map_err(|e| FormatError::Malformed { kind: "image", msg: e.to_string() }))?;
+    let srgb = !matches!(img, image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_));
+    let f = img.into_rgba32f();
+    let (width, height) = f.dimensions();
+    let rgba = f.pixels().map(|p| p.0).collect();
+    Ok(DecodedImage { width, height, rgba, srgb })
+}
+
+/// The image's dimensions read from its header, refused if either edge exceeds
+/// [`MAX_IMAGE_SIZE`] or width × height exceeds `max_texels`. Decodes no pixels.
+fn header_dimensions_within(bytes: &[u8], max_texels: u64) -> Result<(u32, u32)> {
     let reader =
         image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| FormatError::Malformed { kind: "image", msg: e.to_string() })?;
     let (w, h) = reader.into_dimensions().map_err(|e| FormatError::Malformed { kind: "image", msg: e.to_string() })?;
@@ -36,12 +48,7 @@ pub fn decode_image_within(bytes: &[u8], max_texels: u64) -> Result<DecodedImage
     if u64::from(w) * u64::from(h) > max_texels {
         return Err(FormatError::TooLarge(format!("image is {w}x{h}, more than {max_texels} texels; scale it down and import it again")));
     }
-    let img = crate::guard("image", || image::load_from_memory(bytes).map_err(|e| FormatError::Malformed { kind: "image", msg: e.to_string() }))?;
-    let srgb = !matches!(img, image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_));
-    let f = img.into_rgba32f();
-    let (width, height) = f.dimensions();
-    let rgba = f.pixels().map(|p| p.0).collect();
-    Ok(DecodedImage { width, height, rgba, srgb })
+    Ok((w, h))
 }
 
 /// PNG bytes of an `rgb` (sRGB) image whose alpha is `coverage` (`width × height`, top row first):
@@ -73,15 +80,16 @@ mod tests {
     }
 
     #[test]
-    fn decode_image_accepts_a_resource_at_the_cap_edge() {
+    fn a_resource_at_the_cap_edge_passes_the_header_check() {
         // 2^26 texels exactly, as a 16384 × 4096 strip: the check is on texels, not edge length.
         let png = {
             let mut b = Vec::new();
             image::GrayImage::new(16_384, 4096).write_to(&mut std::io::Cursor::new(&mut b), image::ImageFormat::Png).unwrap();
             b
         };
-        let d = decode_image(&png).unwrap();
-        assert_eq!((d.width, d.height), (16_384, 4096));
+        // The header check is all that stands between this image and decoding, so test it
+        // directly: decoding it here would hold two 1 GiB buffers at once.
+        assert_eq!(header_dimensions_within(&png, MAX_RESOURCE_TEXELS).unwrap(), (16_384, 4096));
     }
 
     #[test]
