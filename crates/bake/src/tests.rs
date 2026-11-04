@@ -1208,6 +1208,9 @@ fn skew_correction_preserves_uniform_mesh_normals_and_rejects_invalid_values() {
 struct Counting {
     rays: std::sync::atomic::AtomicU64,
     split_queries: std::sync::atomic::AtomicU64,
+    /// Hemisphere batches, and the most queries in one.
+    batches: std::sync::atomic::AtomicU64,
+    largest_batch: std::sync::atomic::AtomicU64,
 }
 
 struct CountingScene<'a> {
@@ -1235,6 +1238,8 @@ impl RayScene for CountingScene<'_> {
         let rays = passes.iter().flat_map(|pass| queries.iter().map(move |query| cast(pass, query))).sum();
         self.counts.rays.fetch_add(rays, Relaxed);
         self.counts.split_queries.fetch_add(queries.iter().filter(|query| query.subsets != 1).count() as u64, Relaxed);
+        self.counts.batches.fetch_add(1, Relaxed);
+        self.counts.largest_batch.fetch_max(queries.len() as u64, Relaxed);
         self.inner.hemispheres(passes, queries)
     }
 }
@@ -1271,6 +1276,22 @@ fn antialiasing_splits_each_texels_rays_between_its_subsamples() {
         let per_texel = rays.max(antialiasing.samples_per_axis().pow(2));
         assert_eq!(counts.rays.load(Relaxed), 16 * 16 * u64::from(per_texel), "{antialiasing:?} at {rays} rays");
     }
+}
+
+#[test]
+fn antialiased_batches_hold_as_many_texels_as_unantialiased_ones() {
+    // With split rays an antialiased subsample casts few; small batches would leave the GPU idle
+    // between them. The quad covers every subsample: 2^18 texels at 512², 2^20 subsamples at 2×2.
+    let m = quad();
+    let s = with_rays(settings(512, &[BakedMap::AmbientOcclusion]), 4, 0.25);
+    for (s, subsamples) in [(s.clone(), 1 << 18), (antialiased(s, BakeAntialiasing::Subsampling2x2), 1 << 20)] {
+        let (_, counts) = counted(&m, &s);
+        assert_eq!((counts.batches.load(Relaxed), counts.largest_batch.load(Relaxed)), (1, subsamples), "{:?}", s.common.antialiasing);
+    }
+    // Up to 2^20 subsamples a batch: 8×8 at 256² is 2^22 subsamples
+    let s = antialiased(with_rays(settings(256, &[BakedMap::AmbientOcclusion]), 4, 0.25), BakeAntialiasing::Subsampling8x8);
+    let (_, counts) = counted(&m, &s);
+    assert_eq!((counts.batches.load(Relaxed), counts.largest_batch.load(Relaxed)), (4, 1 << 20));
 }
 
 #[test]
