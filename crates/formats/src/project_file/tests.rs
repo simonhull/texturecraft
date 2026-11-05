@@ -388,6 +388,13 @@ fn recovery_does_not_accept_unrelated_json_errors() {
     assert!(error.to_string().contains("duplicate field"), "{error}");
 }
 
+/// The entry was refused by the declared-size check, before any data was read (the chunked
+/// reader would also refuse a short entry, but only after reading it).
+fn assert_size_mismatch(e: &FormatError) {
+    assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
+    assert!(e.to_string().contains(" bytes for a "), "not the declared-size check: {e}");
+}
+
 #[test]
 fn a_baked_map_header_cannot_claim_more_than_the_entry_holds() {
     let m = BakedMap::AmbientOcclusion;
@@ -397,7 +404,7 @@ fn a_baked_map_header_cannot_claim_more_than_the_entry_holds() {
     let bytes = zip_with(&[(&format!("baked/0_{}.bin", m.id()), entry)]);
     let e = load_project_bytes(&bytes).unwrap_err();
     assert!(!is_guard_error(&e), "{e}");
-    assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
+    assert_size_mismatch(&e);
 }
 
 #[test]
@@ -408,7 +415,7 @@ fn a_legacy_named_baked_map_header_cannot_claim_more_than_the_entry_holds() {
     let bytes = zip_with(&[("baked/0_ambient_occlusion.bin", entry)]);
     let e = load_project_bytes(&bytes).unwrap_err();
     assert!(!is_guard_error(&e), "{e}");
-    assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
+    assert_size_mismatch(&e);
 }
 
 #[test]
@@ -419,7 +426,7 @@ fn a_bake_paint_header_cannot_claim_more_than_the_entry_holds() {
     let bytes = zip_with(&[("bake_paint/0_skew.bin", entry)]);
     let e = load_project_bytes(&bytes).unwrap_err();
     assert!(!is_guard_error(&e), "{e}");
-    assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
+    assert_size_mismatch(&e);
 }
 
 #[test]
@@ -432,7 +439,7 @@ fn a_baked_map_entry_shorter_than_its_header_is_malformed() {
     let bytes = zip_with(&[(&format!("baked/0_{}.bin", m.id()), entry)]);
     let e = load_project_bytes(&bytes).unwrap_err();
     assert!(!is_guard_error(&e), "{e}");
-    assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
+    assert_size_mismatch(&e);
 }
 
 /// Overwrite the uncompressed size recorded for `name` in both the central-directory record and
