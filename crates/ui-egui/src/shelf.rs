@@ -123,61 +123,72 @@ pub enum DropZone {
     View3d,
 }
 
-/// Make `resp` a drop target for shelf assets `zone` accepts: outline it while one hovers,
-/// apply it on release.
-pub fn drop_target(app: &mut TextureCraftApp, ui: &Ui, resp: &egui::Response, zone: DropZone) {
-    let tk = Tokens::get(ui.ctx());
-    let accepts = |d: &ShelfDrag| match d.asset {
+/// Highlight accepted shelf assets on hover and apply them on drop
+pub fn drop_target(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response, zone: DropZone) {
+    if app.ui.mode != crate::state::Mode::Painting {
+        return;
+    }
+
+    let tokens = Tokens::get(ui.ctx());
+    let accepts = |drag: &ShelfDrag| match drag.asset {
         Asset::Alpha(_) => true,
         Asset::Material(_) | Asset::Library(_) => zone != DropZone::Brush,
         Asset::Texture(_) => zone == DropZone::View3d,
         Asset::SmartMask(_) | Asset::Filter(_) => false,
     };
-    if resp.dnd_hover_payload::<ShelfDrag>().is_some_and(|d| accepts(&d)) {
-        ui.painter().rect_stroke(resp.rect.shrink(1.0), 3.0, Stroke::new(2.0, tk.accent), egui::StrokeKind::Inside);
+    if response.dnd_hover_payload::<ShelfDrag>().is_some_and(|drag| accepts(&drag)) {
+        ui.painter().rect_stroke(response.rect.shrink(1.0), 3.0, Stroke::new(2.0, tokens.accent), egui::StrokeKind::Inside);
     }
-    let pointer = ui.input(|i| i.pointer.interact_pos());
-    if let Some(d) = dnd_release::<ShelfDrag>(resp)
-        && accepts(&d)
+    let pointer = ui.input(|input| input.pointer.interact_pos());
+    if let Some(drag) = dnd_release::<ShelfDrag>(response)
+        && accepts(&drag)
     {
-        match (&d.asset, pointer) {
-            (Asset::Texture(name), Some(p)) => {
-                let (q, vp) = (p - resp.rect.min, resp.rect.size());
-                app.run("layer.add.decal", json!({"image": name, "x": q.x, "y": q.y, "viewport": [vp.x, vp.y]}));
+        match (&drag.asset, pointer) {
+            (Asset::Texture(name), Some(position)) => {
+                let (local_position, viewport_size) = (position - response.rect.min, response.rect.size());
+                app.run(
+                    "layer.add.decal",
+                    json!({"image": name, "x": local_position.x, "y": local_position.y, "viewport": [viewport_size.x, viewport_size.y]}),
+                );
             }
             (asset, _) => apply(app, asset),
         }
     }
 }
 
-/// The Assets panel body (a dock tab).
+/// The Assets panel body (a dock tab)
 pub fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
-    let tk = Tokens::get(ui.ctx());
+    let tokens = Tokens::get(ui.ctx());
     let ctx = ui.ctx().clone();
     let mut tab = app.ui.shelf_tab.min(TABS.len() - 1);
     let searching = !app.ui.shelf_filter.is_empty();
+
     ui.horizontal_wrapped(|ui| {
+        let button_size = ui.spacing().interact_size.y;
         ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
         for (i, (_, icon, label)) in TABS.iter().enumerate() {
-            if icon_button(ui, icon, tr(label), i == tab && !searching, 24.0).clicked() {
+            if icon_button(ui, icon, tr(label), i == tab && !searching, button_size).clicked() {
                 tab = i;
                 app.ui.shelf_filter.clear();
             }
         }
     });
     app.ui.shelf_tab = tab;
+
     ui.horizontal(|ui| {
-        ui.label(RichText::new(ic::MAGNIFYING_GLASS).color(tk.text_dim));
+        ui.label(RichText::new(ic::MAGNIFYING_GLASS).color(tokens.text_dim));
         ui.add(egui::TextEdit::singleline(&mut app.ui.shelf_filter).hint_text(tr("Search all assets")).desired_width(f32::INFINITY));
     });
     ui.add_space(4.0);
+
     let filter = app.ui.shelf_filter.to_lowercase();
     egui::ScrollArea::vertical().id_salt("shelf_scroll").auto_shrink([false, false]).show(ui, |ui| {
-        // Searching shows matches from every tab, each under its tab's name.
+        // Searching shows matches from every tab, each under its tab's name
         for (i, (t, _, title)) in TABS.iter().enumerate() {
             if filter.is_empty() && i != tab {
                 continue;
             }
+
             let title = tr(title);
             match t {
                 Tab::Materials => materials(app, ui, &ctx, &filter, false, title),
