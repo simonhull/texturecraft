@@ -491,7 +491,12 @@ fn baked_maps_round_trip_bit_exact() {
     let normal: Vec<f32> = (0..4 * 6 * 3).map(|i| [i as f32 * 0.37, 1.0 - i as f32 * 1e-7, -(i as f32).sqrt()][i % 3]).collect();
     let baked = BakedMaps { resolution: 4, maps: [(BakedMap::AmbientOcclusion, Arc::new(ao)), (BakedMap::Normal, Arc::new(normal))].into() };
     s.pf.baked = [(0, baked.clone())].into();
+    let paint = BakePaintData { width: 4, height: 3, values: scalar.to_vec() };
+    s.pf.bake_paint = [((0, texturecraft_core::BakePaintTarget::Skew), paint.clone())].into();
     let back = load_project_bytes(&save_project_bytes(&s.pf).unwrap()).unwrap();
+    let have = &back.bake_paint[&(0, texturecraft_core::BakePaintTarget::Skew)];
+    assert_eq!((have.width, have.height), (paint.width, paint.height));
+    assert!(have.values.iter().zip(&paint.values).all(|(a, b)| a.to_bits() == b.to_bits()), "bake paint differs");
     let got = &back.baked[&0];
     assert_eq!((got.resolution, got.maps.len()), (4, 2));
     for (m, want) in &baked.maps {
