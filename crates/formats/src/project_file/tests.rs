@@ -401,6 +401,17 @@ fn a_baked_map_header_cannot_claim_more_than_the_entry_holds() {
 }
 
 #[test]
+fn a_legacy_named_baked_map_header_cannot_claim_more_than_the_entry_holds() {
+    // Older map names are recovered onto the same reader, so they get the same size check.
+    let mut entry = header(16_384, 16_384, BakedMap::AmbientOcclusion.components(), 0);
+    entry.extend([0u8; 8]);
+    let bytes = zip_with(&[("baked/0_ambient_occlusion.bin", entry)]);
+    let e = load_project_bytes(&bytes).unwrap_err();
+    assert!(!is_guard_error(&e), "{e}");
+    assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
+}
+
+#[test]
 fn a_bake_paint_header_cannot_claim_more_than_the_entry_holds() {
     // Claims 16384 × 16384 (2^28 texels, the largest accepted) but holds 8 bytes of data.
     let mut entry = header(16_384, 16_384, 1, 0);
