@@ -32,8 +32,16 @@ pub fn decode_image_within(bytes: &[u8], max_texels: u64) -> Result<DecodedImage
     let srgb = !matches!(img, image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_));
     let f = img.into_rgba32f();
     let (width, height) = f.dimensions();
-    let rgba = f.pixels().map(|p| p.0).collect();
-    Ok(DecodedImage { width, height, rgba, srgb })
+    Ok(DecodedImage { width, height, rgba: pixels(f.into_raw()), srgb })
+}
+
+/// RGBA samples as pixels, reusing the decoder's buffer rather than copying it: at the texel cap
+/// that buffer is 1 GiB, and a copy would double the peak.
+fn pixels(samples: Vec<f32>) -> Vec<[f32; 4]> {
+    bytemuck::try_cast_vec(samples).unwrap_or_else(|(_, samples)| {
+        // Only if the allocation can't be reused as-is (never for RGBA f32 from `image`).
+        samples.as_chunks::<4>().0.to_vec()
+    })
 }
 
 /// The image's dimensions read from its header, refused if either edge exceeds
@@ -90,6 +98,17 @@ mod tests {
         // The header check is all that stands between this image and decoding, so test it
         // directly: decoding it here would hold two 1 GiB buffers at once.
         assert_eq!(header_dimensions_within(&png, MAX_RESOURCE_TEXELS).unwrap(), (16_384, 4096));
+    }
+
+    #[test]
+    fn samples_become_pixels_in_order_with_or_without_a_copy() {
+        let samples: Vec<f32> = (0..8u8).map(f32::from).collect();
+        let ptr = samples.as_ptr().cast::<u8>();
+        let px = pixels(samples);
+        assert_eq!(px, [[0.0, 1.0, 2.0, 3.0], [4.0, 5.0, 6.0, 7.0]]);
+        assert_eq!(px.as_ptr().cast::<u8>(), ptr, "the decoder's buffer is reused, not copied");
+        // A length that isn't whole pixels can't be reused: copied, the stray sample dropped.
+        assert_eq!(pixels((0..5u8).map(f32::from).collect()), [[0.0, 1.0, 2.0, 3.0]]);
     }
 
     #[test]
