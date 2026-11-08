@@ -3918,6 +3918,7 @@ name = "texturecraft-formats"
 version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
+ "bytemuck",
  "exr",
  "flate2",
  "gltf",
