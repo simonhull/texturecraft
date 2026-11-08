@@ -54,7 +54,7 @@ fn header_dimensions_within(bytes: &[u8], max_texels: u64) -> Result<(u32, u32)>
         return Err(FormatError::TooLarge(format!("image is {w}x{h} (limit {MAX_IMAGE_SIZE})")));
     }
     if u64::from(w) * u64::from(h) > max_texels {
-        return Err(FormatError::TooLarge(format!("image is {w}x{h}, more than {max_texels} texels; scale it down and import it again")));
+        return Err(FormatError::TooLarge(format!("image is {w}x{h}, more than {max_texels} texels; use a smaller image")));
     }
     Ok((w, h))
 }
@@ -84,7 +84,9 @@ mod tests {
             b
         };
         assert!(png.len() < 1 << 20, "the test image compresses well ({} bytes)", png.len());
-        assert!(matches!(decode_image(&png), Err(FormatError::TooLarge(_))));
+        let Err(FormatError::TooLarge(msg)) = decode_image(&png) else { panic!("refused as too large") };
+        // Imports, linked maps and opened projects all decode resources: the advice fits each.
+        assert!(msg.ends_with("use a smaller image"), "{msg}");
     }
 
     #[test]
