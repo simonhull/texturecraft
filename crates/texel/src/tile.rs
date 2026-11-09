@@ -233,6 +233,20 @@ mod tests {
         assert_eq!(b.get(0, 0)[..2], [1, 2]);
     }
 
+    /// Un-sharing the table alone isn't enough: the tiles in it are shared too.
+    #[test]
+    fn writing_a_shared_tile_leaves_the_clone_alone() {
+        let mut a = TileImage::new(512, 512, 2);
+        a.set(0, 0, &[1, 2]);
+        let mut b = a.clone();
+        b.set(0, 0, &[3, 4]);
+        b.tile_mut(0, 0, &[]).unwrap()[2..4].copy_from_slice(&[5, 6]);
+        assert_eq!(a.get(0, 0)[..2], [1, 2]);
+        assert_eq!(a.get(1, 0)[..2], [0, 0]);
+        assert_eq!(b.get(0, 0)[..2], [3, 4]);
+        assert_eq!(b.get(1, 0)[..2], [5, 6]);
+    }
+
     #[test]
     fn out_of_range_writes_do_not_unshare() {
         let mut a = TileImage::new(512, 512, 2);
