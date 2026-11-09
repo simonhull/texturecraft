@@ -85,7 +85,7 @@ impl DisplayKind {
     /// maps, Extra's alpha holds the tile scale, so they differ from the default even for a set
     /// without any of their channels.
     fn reads_more_than_channels(self) -> bool {
-        matches!(self, DisplayKind::BaseColor | DisplayKind::Orm | DisplayKind::Normal | DisplayKind::Extra)
+        matches!(self, DisplayKind::Orm | DisplayKind::Normal | DisplayKind::Extra)
     }
 
     /// The texel of a set that has none of this texture's channels (the GPU clear value).
@@ -96,9 +96,9 @@ impl DisplayKind {
     }
 }
 
-/// Display kinds to convert for a set with `channels`: always BaseColor, Orm, Normal and Extra
-/// (they read baked maps or tile scales too); Emissive, Sheen, Lobes and Height only when the set
-/// has one of their channels (otherwise every tile is the placeholder default).
+/// Display kinds to convert for a set with `channels`: always Orm, Normal and Extra (they read
+/// baked maps or tile scales too); the others only when the set has one of their channels
+/// (otherwise every tile is the placeholder default).
 pub fn kinds_for(channels: &[Channel]) -> impl Iterator<Item = DisplayKind> + '_ {
     DisplayKind::ALL.into_iter().filter(|k| k.reads_more_than_channels() || channels.iter().any(|c| DisplayKind::of_channel(*c) == *k))
 }
@@ -230,11 +230,25 @@ mod tests {
 
     #[test]
     fn kinds_for_skips_kinds_without_channels() {
-        let always = [DisplayKind::BaseColor, DisplayKind::Orm, DisplayKind::Normal, DisplayKind::Extra];
-        assert_eq!(kinds_for(&[]).collect::<Vec<_>>(), always);
-        assert_eq!(kinds_for(&[Channel::BaseColor, Channel::Roughness]).collect::<Vec<_>>(), always);
+        assert_eq!(kinds_for(&[]).collect::<Vec<_>>(), [DisplayKind::Orm, DisplayKind::Normal, DisplayKind::Extra]);
+        let with_base: Vec<_> = kinds_for(&[Channel::BaseColor, Channel::Roughness]).collect();
+        assert_eq!(with_base, [DisplayKind::BaseColor, DisplayKind::Orm, DisplayKind::Normal, DisplayKind::Extra]);
         let with_sheen: Vec<_> = kinds_for(&[Channel::SheenColor]).collect();
-        assert_eq!(with_sheen, [DisplayKind::BaseColor, DisplayKind::Orm, DisplayKind::Normal, DisplayKind::Sheen, DisplayKind::Extra]);
+        assert_eq!(with_sheen, [DisplayKind::Orm, DisplayKind::Normal, DisplayKind::Sheen, DisplayKind::Extra]);
+    }
+
+    #[test]
+    fn kinds_skipped_for_a_set_are_its_default_texel() {
+        for channels in [&[][..], &[Channel::Roughness, Channel::Metallic], &[Channel::SheenColor, Channel::Transmission]] {
+            let mut comp = Composite::new(channels, 64);
+            for img in comp.channels.values_mut() {
+                img.set(0, 0, &[to_u16(0.3); 3]);
+            }
+            for kind in DisplayKind::ALL.into_iter().filter(|k| !kinds_for(channels).any(|n| n == *k)) {
+                let want = kind.default_texel().repeat(TILE_AREA);
+                assert!(tile_bytes(&comp, &BakedMaps::default(), kind, 0, 0) == want, "{kind:?} for {channels:?}");
+            }
+        }
     }
 
     #[test]
