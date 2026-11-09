@@ -1,7 +1,8 @@
 use serde_json::{Value, json};
+use texturecraft_engine::compose::PixelStore;
 use texturecraft_engine::core::Channel;
 use texturecraft_engine::geom::primitives;
-use texturecraft_engine::{Session, command_specs, execute};
+use texturecraft_engine::{Document, Session, command_specs, execute};
 
 fn session() -> Session {
     let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 256).unwrap();
@@ -10,6 +11,13 @@ fn session() -> Session {
     s.camera.pitch = 0.0;
     s.update();
     s
+}
+
+/// Whether two documents hold the same content (`Document` has no `PartialEq`). Destructured so
+/// a new field must be compared here too.
+fn same_document(a: &Document, b: &Document) -> bool {
+    let Document { project, pixels: PixelStore { layers, masks }, baked, resources } = a;
+    *project == b.project && *layers == b.pixels.layers && *masks == b.pixels.masks && *baked == b.baked && *resources == b.resources
 }
 
 #[test]
@@ -132,22 +140,25 @@ fn panic_hunt() {
 #[test]
 fn a_panic_inside_an_edit_restores_the_document() {
     let mut s = session();
-    let project = s.doc.project.clone();
+    let before = s.doc.clone();
     let history = s.history_labels();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = s.edit("Half done", |s| -> texturecraft_engine::Result<()> {
             s.doc.project.name = "changed".into();
+            s.doc.pixels.mask_mut(texturecraft_engine::core::LayerId(u64::MAX), (64, 64));
+            s.doc.resources.insert("half.png".into(), std::sync::Arc::new(vec![1, 2, 3]));
             panic!("boom");
         });
     }));
     assert!(r.is_err(), "the panic still reaches the caller");
-    assert_eq!(s.doc.project, project, "the half-made change was rolled back");
+    assert!(same_document(&s.doc, &before), "the half-made change was rolled back");
     assert_eq!(s.history_labels(), history, "no undo step was recorded");
 }
 
-/// A command that fails leaves the project as it was (AGENTS rule 5: commands are atomic).
+/// A command that fails leaves the document and history as they were (AGENTS rule 5: commands
+/// are atomic).
 #[test]
-fn failed_commands_leave_the_project_unchanged() {
+fn failed_commands_leave_the_document_unchanged() {
     let hostile = [
         Value::Null,
         json!({}),
@@ -163,13 +174,13 @@ fn failed_commands_leave_the_project_unchanged() {
         }
         for p in &hostile {
             let mut s = session();
-            let before = s.doc.project.clone();
-            if execute(&mut s, spec.id, p).is_err() && s.doc.project != before {
+            let (before, history) = (s.doc.clone(), s.history_labels());
+            if execute(&mut s, spec.id, p).is_err() && (!same_document(&s.doc, &before) || s.history_labels() != history) {
                 offenders.push(format!("{} {p}", spec.id));
             }
         }
     }
-    assert!(offenders.is_empty(), "failed commands changed the project:\n{}", offenders.join("\n"));
+    assert!(offenders.is_empty(), "failed commands changed the document:\n{}", offenders.join("\n"));
 }
 
 #[test]
