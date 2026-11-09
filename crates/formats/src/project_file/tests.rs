@@ -575,3 +575,137 @@ fn truncated_version_2_baked_map_is_an_error() {
     assert!(!is_guard_error(&e), "{e}");
     assert!(matches!(e, FormatError::Malformed { .. }), "{e}");
 }
+
+#[test]
+fn compression_batches_are_capped_by_entry_count_and_bytes() {
+    // Count cap alone.
+    assert_eq!(compression_batches(&[1, 1, 1, 1, 1], 2, 100), vec![0..2, 2..4, 4..5]);
+    // Byte cap: a batch closes before an entry that would take it past the cap.
+    assert_eq!(compression_batches(&[40, 40, 40, 10], 8, 100), vec![0..2, 2..4]);
+    // An entry larger than the cap still goes, alone.
+    assert_eq!(compression_batches(&[10, 500, 10], 8, 100), vec![0..1, 1..2, 2..3]);
+    assert_eq!(compression_batches(&[], 8, 100), Vec::<std::ops::Range<usize>>::new());
+    // Zero threads still makes progress.
+    assert_eq!(compression_batches(&[1, 1], 0, 100), vec![0..1, 1..2]);
+}
+
+/// Patterned f32s that cover every byte value in every byte position, so a plane that lands
+/// shifted, swapped or on the wrong component shows up. Some are NaNs: compare bits.
+fn patterned(len: usize, seed: u32) -> Vec<f32> {
+    (0..len as u32).map(|i| f32::from_bits(i.wrapping_add(seed).wrapping_mul(0x9e37_79b9))).collect()
+}
+
+fn same_bits(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// The layout version in the header of each `.bin` entry of a saved project, by name.
+fn entry_versions(bytes: &[u8]) -> BTreeMap<String, u32> {
+    let mut zip = ZipArchive::new(Cursor::new(bytes)).unwrap();
+    let mut versions = BTreeMap::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).unwrap();
+        let name = f.name().unwrap().to_string();
+        if name.ends_with(".bin") {
+            let mut h = [0u8; 8];
+            f.read_exact(&mut h).unwrap();
+            versions.insert(name, u32::from_le_bytes([h[4], h[5], h[6], h[7]]));
+        }
+    }
+    versions
+}
+
+#[test]
+fn large_non_square_baked_maps_round_trip_across_chunk_boundaries() {
+    // 600×450 = 270 000 texels: past the reader's 262 144-texel chunk, the 65 536-float v1 read
+    // and the writer's 16 384-texel chunk, and not a multiple of any of them.
+    let (w, h) = (600u32, 450u32);
+    let texels = (w * h) as usize;
+    let mut s = sample();
+    let ao = patterned(texels, 1);
+    let normal = patterned(texels * 3, 7);
+    s.pf.baked =
+        [(0, BakedMaps { resolution: w, maps: [(BakedMap::AmbientOcclusion, Arc::new(ao.clone())), (BakedMap::Normal, Arc::new(normal.clone()))].into() })]
+            .into();
+    let paint = BakePaintData { width: h, height: w, values: patterned(texels, 3) };
+    s.pf.bake_paint = [((0, texturecraft_core::BakePaintTarget::Cage), paint.clone())].into();
+    s.pf.pixels.layer_mut(s.paint, Channel::BaseColor, (128, 128)).set(3, 4, &[1, 2, 3, 4]);
+
+    let bytes = save_project_bytes(&s.pf).unwrap();
+    let versions = entry_versions(&bytes);
+    for (name, v) in &versions {
+        let want = if name.starts_with("pixels/") { BIN_VERSION } else { BAKED_VERSION };
+        assert_eq!(*v, want, "{name}");
+    }
+    assert!(versions.keys().any(|n| n.starts_with("pixels/")), "{versions:?}");
+    assert!(versions.keys().any(|n| n.starts_with("baked/")), "{versions:?}");
+    assert!(versions.keys().any(|n| n.starts_with("bake_paint/")), "{versions:?}");
+
+    let back = load_project_bytes(&bytes).unwrap();
+    let maps = &back.baked[&0];
+    assert_eq!((maps.resolution, maps.height(BakedMap::AmbientOcclusion), maps.height(BakedMap::Normal)), (w, h, h));
+    assert!(same_bits(&maps.maps[&BakedMap::AmbientOcclusion], &ao), "AO differs");
+    assert!(same_bits(&maps.maps[&BakedMap::Normal], &normal), "normal differs");
+    let have = &back.bake_paint[&(0, texturecraft_core::BakePaintTarget::Cage)];
+    assert_eq!((have.width, have.height), (h, w));
+    assert!(same_bits(&have.values, &paint.values), "bake paint differs");
+}
+
+#[test]
+fn large_non_square_version_1_maps_still_load() {
+    let (w, h) = (600u32, 450u32);
+    let texels = (w * h) as usize;
+    let normal = patterned(texels * 3, 11);
+    let paint = patterned(texels, 5);
+    let bytes =
+        zip_with(&[(&format!("baked/1_{}.bin", BakedMap::Normal.id()), baked_v1(w, h, 3, &normal)), ("bake_paint/1_skew.bin", baked_v1(w, h, 1, &paint))]);
+    let pf = load_project_bytes(&bytes).unwrap();
+    assert_eq!((pf.baked[&1].resolution, pf.baked[&1].height(BakedMap::Normal)), (w, h));
+    assert!(same_bits(&pf.baked[&1].maps[&BakedMap::Normal], &normal));
+    let have = &pf.bake_paint[&(1, texturecraft_core::BakePaintTarget::Skew)];
+    assert_eq!((have.width, have.height), (w, h));
+    assert!(same_bits(&have.values, &paint));
+}
+
+#[test]
+fn newer_bake_paint_and_tile_versions_are_refused() {
+    let mut paint = baked_v1(2, 2, 1, &[0.0; 4]);
+    paint.splice(4..8, 3u32.to_le_bytes());
+    let bytes = zip_with(&[("bake_paint/0_skew.bin", paint)]);
+    assert!(matches!(load_project_bytes(&bytes), Err(FormatError::NewerVersion { found: 3, supported: 2 })));
+
+    // Tiles stay at version 1: the baked-map version does not apply to them.
+    let s = sample();
+    let mut tiles = tile_bin(128, 5, &[]);
+    tiles.splice(4..8, 2u32.to_le_bytes());
+    let bytes = zip_with(&[(&format!("pixels/layer_{}_{}.bin", s.paint.0, Channel::BaseColor.id()), tiles)]);
+    assert!(matches!(load_project_bytes(&bytes), Err(FormatError::NewerVersion { found: 2, supported: 1 })));
+}
+
+#[test]
+fn parallel_saves_match_a_single_threaded_save_byte_for_byte() {
+    // More entries than threads, so the save runs several batches.
+    let mut s = sample();
+    for i in 0..10 {
+        s.pf.project.texture_sets.push(TextureSet::new(format!("T{i}"), i + 2, 32));
+    }
+    for ts in 0..s.pf.project.texture_sets.len() {
+        let seed = ts as u32 * 13;
+        let maps = [(BakedMap::AmbientOcclusion, Arc::new(patterned(32 * 32, seed))), (BakedMap::Normal, Arc::new(patterned(32 * 32 * 3, seed + 1)))];
+        s.pf.baked.insert(ts, BakedMaps { resolution: 32, maps: maps.into() });
+        s.pf.bake_paint.insert((ts, texturecraft_core::BakePaintTarget::Skew), BakePaintData { width: 32, height: 16, values: patterned(32 * 16, seed + 2) });
+    }
+    let save_with = |threads| rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(|| save_project_bytes(&s.pf).unwrap());
+    let one = save_with(1);
+    assert_eq!(save_with(3), one);
+    assert_eq!(save_with(3), one);
+
+    let back = load_project_bytes(&one).unwrap();
+    assert_eq!(back.baked.len(), s.pf.baked.len());
+    for (ts, maps) in &s.pf.baked {
+        for (m, want) in &maps.maps {
+            assert!(same_bits(&back.baked[ts].maps[m], want), "{ts} {m:?}");
+        }
+    }
+    assert_eq!(back.bake_paint.len(), s.pf.bake_paint.len());
+}

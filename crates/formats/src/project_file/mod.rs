@@ -18,11 +18,14 @@
 //! count of 0. Baked maps are version 2: for each component, four byte planes (every texel's
 //! byte 0 of the f32 LE, then byte 1, 2 and 3), which deflate compresses far better. Version 1
 //! baked maps (`width × height × components` interleaved f32 LE) are still read. Bake paint
-//! maps use the baked-map layout with one component. Pixels of a UV-tiled texture set cover its
+//! maps use the baked-map layout with one component. Pixel tiles stay at version 1. Builds that
+//! predate version 2 refuse a project holding baked or bake paint maps with a newer-version error
+//! rather than misreading it. Pixels of a UV-tiled texture set cover its
 //! whole atlas (`resolution` per tile, see `TileGrid`).
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Cursor, Read, Seek, Write};
+use std::ops::Range;
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -41,8 +44,13 @@ const BIN_VERSION: u32 = 1;
 /// Version of the baked-map layout: per-component planes of byte-shuffled f32s (version 1 is the
 /// interleaved f32 layout, still read).
 const BAKED_VERSION: u32 = 2;
-/// Floats per buffered write: 64 KiB.
+/// Texels per buffered write of a byte plane: each write is `WRITE_CHUNK` bytes (16 KiB).
 const WRITE_CHUNK: usize = 16 * 1024;
+/// Uncompressed bytes deflated in parallel at once. Compressed entries are held until their
+/// batch is appended, so this bounds that extra memory whatever the core count. Large enough
+/// that 4096² maps (201 MB for three components) still compress several at a time: at 256 MiB
+/// the save of seven such maps took 2.6 s instead of 0.65 s.
+const BATCH_BYTES: u64 = 1 << 30;
 const MAX_JSON: u64 = 256 << 20;
 const MAX_THUMBNAIL: u64 = 64 << 20;
 const MAX_RESOURCE: u64 = 512 << 20;
@@ -200,6 +208,15 @@ enum Payload<'a> {
 }
 
 impl Payload<'_> {
+    /// Uncompressed size in bytes.
+    fn len(&self) -> u64 {
+        match self {
+            Self::Bytes(b) => b.len() as u64,
+            Self::Tiles(img) => 24 + img.allocated_count() as u64 * (8 + TILE_AREA as u64 * img.comps() as u64 * 2),
+            Self::Baked { data, .. } => 24 + data.len() as u64 * 4,
+        }
+    }
+
     fn write_to(&self, w: &mut impl Write) -> std::io::Result<()> {
         match self {
             Self::Bytes(b) => w.write_all(b),
@@ -229,6 +246,24 @@ fn append_entry<W: Write + Seek>(zip: &mut ZipWriter<W>, compressed: Vec<u8>) ->
     let mut archive = ZipArchive::new(Cursor::new(compressed)).map_err(zip_err)?;
     let entry = archive.by_index(0).map_err(zip_err)?;
     zip.raw_copy_file(entry).map_err(zip_err)
+}
+
+/// Consecutive batches of entries (by uncompressed `sizes`) to deflate in parallel: at most
+/// `threads` entries and `cap` bytes each, except that an entry larger than `cap` goes alone.
+fn compression_batches(sizes: &[u64], threads: usize, cap: u64) -> Vec<Range<usize>> {
+    let mut batches = Vec::new();
+    let (mut start, mut bytes) = (0, 0u64);
+    for (i, &size) in sizes.iter().enumerate() {
+        if i > start && (i - start >= threads || bytes.saturating_add(size) > cap) {
+            batches.push(start..i);
+            (start, bytes) = (i, 0);
+        }
+        bytes = bytes.saturating_add(size);
+    }
+    if start < sizes.len() {
+        batches.push(start..sizes.len());
+    }
+    batches
 }
 
 fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
@@ -280,8 +315,9 @@ fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
             entries.push((format!("baked/{ts}_{}.bin", m.id()), Payload::Baked { data, width, height, comps: m.components() }));
         }
     }
-    // Batches of one entry per thread bound how many compressed entries are held at once.
-    for batch in entries.chunks(rayon::current_num_threads().max(1)) {
+    let sizes: Vec<u64> = entries.iter().map(|(_, payload)| payload.len()).collect();
+    for range in compression_batches(&sizes, rayon::current_num_threads(), BATCH_BYTES) {
+        let batch = entries.get(range).ok_or_else(|| FormatError::Invalid("compression batch out of range".into()))?;
         let compressed = batch.par_iter().map(|(name, payload)| compress_entry(name, payload)).collect::<Result<Vec<_>>>()?;
         for entry in compressed {
             append_entry(&mut zip, entry)?;
@@ -414,7 +450,8 @@ fn read_tiles(r: &mut impl Read, size: (u32, u32), comps: usize, budget: &mut Bu
     Ok(img)
 }
 
-/// A baked map: (width, height, data).
+/// A baked map: (width, height, data). `declared` is the entry's uncompressed size from the zip
+/// directory, which must be exactly the 24-byte header plus the map's f32s.
 fn read_baked(r: &mut impl Read, declared: u64, comps: usize, budget: &mut Budget, what: &str) -> Result<(u32, u32, Vec<f32>)> {
     let (version, w, h, c, _) = read_header(r, what, BAKED_VERSION)?;
     if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_TEXELS || c != comps {
