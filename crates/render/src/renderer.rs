@@ -2084,6 +2084,12 @@ mod tests {
         assert_eq!(base_width(&h), 256, "accepted: installed");
         assert!(!h.renderer.awaiting_gpu());
         assert!(h.renderer.take_memory_failures().is_empty());
+        // The tile went in while the placeholder's (one-level) chain was rebuilt: installing
+        // must rebuild the new texture's whole chain.
+        let installed = mip_levels(&h, DisplayKind::BaseColor);
+        h.renderer.sets[0].mips_dirty[0] = MipsDirty::All;
+        prepare(&mut h);
+        assert_eq!(installed, mip_levels(&h, DisplayKind::BaseColor), "the installed texture's mips are complete");
     }
 
     #[test]
@@ -2136,40 +2142,47 @@ mod tests {
         eprintln!("bench_mips [{}] 8192^2, one tile per frame: avg {avg:?}, worst {worst:?}", h.adapter_name);
     }
 
-    /// Every mip level below 0 of the base color texture of set 0.
-    fn mip_levels(h: &Headless) -> Vec<Vec<u8>> {
-        let tex = h.renderer.display_textures()[0][0];
+    /// Every mip level below 0 of the `kind` texture of set 0.
+    fn mip_levels(h: &Headless, kind: DisplayKind) -> Vec<Vec<u8>> {
+        let ki = DisplayKind::ALL.iter().position(|k| *k == kind).unwrap();
+        let tex = h.renderer.display_textures()[0][ki];
         let last = mip_count(tex.width().max(tex.height())) - 1;
         (1..=last).map(|l| crate::readback::Readback::blocking_level(&h.device, &h.queue, tex, l).unwrap().2).collect()
     }
 
-    /// Paint `first` tiles, settle, then add each of `later` regionally and compare every level
-    /// against a forced full regeneration.
-    fn assert_regional_equals_full(size: (u32, u32), first: &[(u32, u32)], later: &[(u32, u32)]) {
+    /// Paint `first` tiles of `kind` (an RGBA8 format), settle, then upload each frame of `later`
+    /// (its tiles all before one prepare) regionally and compare every level against a forced
+    /// full regeneration.
+    fn assert_regional_equals_full(kind: DisplayKind, size: (u32, u32), first: &[(u32, u32)], later: &[&[(u32, u32)]]) {
         let Ok(mut h) = Headless::new() else {
             eprintln!("skipping: no GPU adapter");
             return;
         };
+        let ki = DisplayKind::ALL.iter().position(|k| *k == kind).unwrap();
         h.renderer.set_texture_sets(&h.device, &h.queue, &[(size, 0)], 1);
         let colour = |i: u32| [(37 * i % 200 + 40) as u8, (91 * i % 200 + 40) as u8, (151 * i % 200 + 40) as u8, 255];
         let up = |h: &mut Headless, i: u32, (tx, ty): (u32, u32)| {
-            h.renderer.upload_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, tx, ty, &colour(i).repeat(64 * 64));
+            h.renderer.upload_tile(&h.device, &h.queue, 0, kind, tx, ty, &colour(i).repeat(64 * 64));
         };
+        assert!(h.renderer.sets[0].mips_dirty.iter().all(|d| *d == MipsDirty::All), "new textures: every chain stale");
         for (i, t) in (0..).zip(first) {
             up(&mut h, i, *t);
         }
         prepare(&mut h);
-        for (i, t) in (10..).zip(later) {
-            up(&mut h, i, *t);
-            assert!(matches!(h.renderer.sets[0].mips_dirty[0], MipsDirty::Region { .. }));
+        assert!(h.renderer.sets[0].mips_dirty.iter().all(|d| *d == MipsDirty::Clean));
+        for (i, frame) in (10..).step_by(10).zip(later) {
+            for (j, t) in (i..).zip(*frame) {
+                up(&mut h, j, *t);
+            }
+            assert!(matches!(h.renderer.sets[0].mips_dirty[ki], MipsDirty::Region { .. }));
             prepare(&mut h);
-            assert_eq!(h.renderer.sets[0].mips_dirty[0], MipsDirty::Clean);
-            let regional = mip_levels(&h);
-            h.renderer.sets[0].mips_dirty[0] = MipsDirty::All;
+            assert_eq!(h.renderer.sets[0].mips_dirty[ki], MipsDirty::Clean);
+            let regional = mip_levels(&h, kind);
+            h.renderer.sets[0].mips_dirty[ki] = MipsDirty::All;
             prepare(&mut h);
-            let full = mip_levels(&h);
+            let full = mip_levels(&h, kind);
             for (level, (a, b)) in regional.iter().zip(&full).enumerate() {
-                assert_eq!(a, b, "{size:?}, tile {t:?}: regional and full mips differ at level {}", level + 1);
+                assert_eq!(a, b, "{kind:?} {size:?}, tiles {frame:?}: regional and full mips differ at level {}", level + 1);
             }
         }
     }
@@ -2177,14 +2190,27 @@ mod tests {
     #[test]
     fn regional_mips_match_full() {
         // The last column and row included (edge clamping).
-        assert_regional_equals_full((512, 512), &[(0, 0), (4, 4), (7, 2)], &[(3, 5), (7, 7)]);
+        assert_regional_equals_full(DisplayKind::BaseColor, (512, 512), &[(0, 0), (4, 4), (7, 2)], &[&[(3, 5)], &[(7, 7)]]);
+    }
+
+    #[test]
+    fn regional_mips_match_full_in_a_linear_format() {
+        // Orm is RGBA8 linear, not sRGB like base color: its own mip pipeline.
+        assert_regional_equals_full(DisplayKind::Orm, (512, 512), &[(0, 0), (4, 4)], &[&[(3, 5)], &[(7, 0)]]);
+    }
+
+    #[test]
+    fn regional_mips_match_full_for_several_tiles_in_one_frame() {
+        // Disjoint tiles far apart: their union's bounding rectangle is rebuilt in one go.
+        assert_regional_equals_full(DisplayKind::BaseColor, (512, 512), &[(2, 2)], &[&[(0, 7), (6, 1), (3, 3)], &[(7, 7), (0, 0)]]);
+        assert_regional_equals_full(DisplayKind::Orm, (192, 192), &[(0, 0)], &[&[(2, 0), (0, 2)]]);
     }
 
     #[test]
     fn regional_mips_match_full_on_non_power_of_two_sets() {
         // 3×1 tiles: odd widths further down the chain.
-        assert_regional_equals_full((192, 64), &[(0, 0)], &[(1, 0), (2, 0)]);
+        assert_regional_equals_full(DisplayKind::BaseColor, (192, 64), &[(0, 0)], &[&[(1, 0)], &[(2, 0)]]);
         // Odd in both directions.
-        assert_regional_equals_full((192, 192), &[(0, 0)], &[(1, 1), (2, 2), (0, 2)]);
+        assert_regional_equals_full(DisplayKind::BaseColor, (192, 192), &[(0, 0)], &[&[(1, 1)], &[(2, 2)], &[(0, 2)]]);
     }
 }
