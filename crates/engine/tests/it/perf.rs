@@ -351,8 +351,9 @@ fn bench_8k_resize() {
     drop(d);
 }
 
-/// Smooth, realistic data for a baked map of `comps` components: normals vary slowly, AO is a
-/// low-frequency sine product, Id has a few flat regions and Position is a linear ramp.
+/// Smooth, realistic data for a baked map: normals vary slowly, Id has a few flat regions,
+/// Position is a linear ramp, and every one-component map (AO, curvature, thickness, ...) is the
+/// same low-frequency sine product (9 cycles across, 7 down).
 fn baked_data(kind: texturecraft_engine::core::BakedMap, res: u32) -> Vec<f32> {
     use texturecraft_engine::core::BakedMap;
     let n = res as usize;
@@ -380,6 +381,7 @@ fn baked_data(kind: texturecraft_engine::core::BakedMap, res: u32) -> Vec<f32> {
 
 /// Run `f` while sampling this process's resident set (via `ps`, every 50 ms): returns the result
 /// and the highest sample in MB. Coarse, but it isolates one phase from the rest of the test.
+/// Where `ps` is missing or fails (Windows), every sample is 0 and so is the result.
 fn with_peak_rss<T>(f: impl FnOnce() -> T) -> (T, f64) {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     let pid = std::process::id().to_string();
@@ -407,6 +409,12 @@ fn with_peak_rss<T>(f: impl FnOnce() -> T) -> (T, f64) {
     })
 }
 
+/// Save and load timings for a project with seven 4096² baked maps (about 1 GB of f32s, held
+/// several times over at peak). Run in release:
+/// `cargo test -p texturecraft-engine --release --test it bench_save -- --ignored --nocapture`.
+/// It prints how long building the `ProjectFile`, saving and loading take, the file size with
+/// baked and other entries apart, and resident memory: absolute before the save (the project
+/// already in memory), then the peak during save and load with the rise over that baseline.
 #[test]
 #[ignore]
 fn bench_save() {
@@ -428,10 +436,15 @@ fn bench_save() {
     println!("[save] RSS before save {before_rss:.0} MB");
     let t = Instant::now();
     let (bytes, save_rss) = with_peak_rss(|| texturecraft_engine::formats::save_project_bytes(&pf).unwrap());
-    println!("[save] save_project_bytes: {:.0} ms, file {:.1} MB, peak RSS during save {save_rss:.0} MB", t.elapsed().as_secs_f64() * 1e3, mb(bytes.len()));
+    println!(
+        "[save] save_project_bytes: {:.0} ms, file {:.1} MB, peak RSS during save {save_rss:.0} MB (+{:.0})",
+        t.elapsed().as_secs_f64() * 1e3,
+        mb(bytes.len()),
+        save_rss - before_rss
+    );
     let t = Instant::now();
     let (loaded, load_rss) = with_peak_rss(|| texturecraft_engine::formats::load_project_bytes(&bytes).unwrap());
-    println!("[save] load_project_bytes: {:.0} ms, peak RSS during load {load_rss:.0} MB", t.elapsed().as_secs_f64() * 1e3);
+    println!("[save] load_project_bytes: {:.0} ms, peak RSS during load {load_rss:.0} MB (+{:.0})", t.elapsed().as_secs_f64() * 1e3, load_rss - before_rss);
     assert_eq!(loaded.baked, pf.baked);
 
     let mut zip = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
