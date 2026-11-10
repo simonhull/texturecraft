@@ -1295,6 +1295,43 @@ fn antialiased_batches_hold_as_many_texels_as_unantialiased_ones() {
 }
 
 #[test]
+fn antialiased_spans_write_each_texel_in_place() {
+    // Three 32-texel UV tiles in a row: at 8×8 a 96-texel row is one full span of 64 texels and a
+    // partial one of 32. Position is linear across the quad, so each texel's 8×8 mean equals its
+    // 1×1 centre sample: a texel written to the wrong place, or a span out of order, shows at once.
+    let m = quad();
+    let s = settings(32, &[BakedMap::Position, BakedMap::WorldNormal]);
+    assert_eq!(span_texels(BakeAntialiasing::Subsampling8x8.samples_per_axis() as usize), 64);
+    let bake_tiles = |s: &BakeSettings| {
+        let bvh = Bvh::new(&m);
+        let req = BakeRequest {
+            low_base_color: &[],
+            mesh: &m,
+            bvh: &bvh,
+            material: 0,
+            settings: s,
+            high: None,
+            cage: None,
+            skew: None,
+            cage_paint: None,
+            tiles: (3, 1),
+        };
+        bake(&req, &Progress::new()).unwrap()
+    };
+    let (plain, smooth) = (bake_tiles(&s), bake_tiles(&antialiased(s.clone(), BakeAntialiasing::Subsampling8x8)));
+    assert_eq!((smooth.resolution, smooth.height), (96, 32));
+    for map in [BakedMap::Position, BakedMap::WorldNormal] {
+        let (plain, smooth) = (&plain.maps[&map], &smooth.maps[&map]);
+        assert_eq!(plain.len(), smooth.len());
+        let worst = plain.iter().zip(smooth).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "{map:?}: an 8×8 texel differs from the 1×1 one by {worst}");
+    }
+    // The positions vary along the row (a constant map would hide misplaced texels)
+    let position = &plain.maps[&BakedMap::Position];
+    assert!((position[95 * 3] - position[0]).abs() > 0.5, "{} vs {}", position[95 * 3], position[0]);
+}
+
+#[test]
 fn without_antialiasing_a_texel_is_one_query_casting_every_ray() {
     let m = primitives::material_ball();
     let s = with_rays(settings(32, &[BakedMap::AmbientOcclusion, BakedMap::Thickness]), 12, 0.25);
