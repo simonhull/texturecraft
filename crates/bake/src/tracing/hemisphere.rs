@@ -8,6 +8,10 @@ pub struct Hemisphere {
     pub kind: RayKind,
     /// Rays per texel: the stratified pattern that a texel's queries share (see `Query::subsets`)
     pub rays: u32,
+    /// Antialiasing subsamples per texel: the most shares a texel's rays split into. A tracer that
+    /// spreads a query's rays over threads sizes them for this share, the same in every batch, so
+    /// that how a bake is batched never changes its results.
+    pub subsamples: u32,
     /// Maximum ray distance in mesh units
     pub dmax: f32,
     pub min_distance: f32,

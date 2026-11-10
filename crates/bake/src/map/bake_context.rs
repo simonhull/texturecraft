@@ -43,6 +43,7 @@ impl<'a> BakeContext<'a> {
             settings.maps.is_enabled(map).then_some(Hemisphere {
                 kind,
                 rays: ray_settings.rays.max(subsamples),
+                subsamples,
                 dmax: ray_settings.max_distance * units,
                 min_distance: ray_settings.min_distance * units,
                 attenuation: AmbientOcclusionAttenuation::None,

@@ -371,15 +371,15 @@ impl RayScene for GpuScene<'_> {
             let rows = [row(q.pos, q.rot[0].to_bits()), row(q.nrm, q.rot[1].to_bits()), row(q.geo, q.key), [root, q.subset, q.subsets.max(1), 0]];
             Ok(bytemuck::cast::<[[u32; 4]; 4], [u8; 64]>(rows))
         };
-        // Antialiased texels split their rays between subsamples: size the lanes for a full texel's share,
+        // Antialiased texels split their rays between subsamples: size the lanes for a full texel's share
+        // (from the bake's subsamples, not this batch's queries, so batching never changes a result),
         // and the dispatches for the largest share (an edge texel's few subsamples cast more rays each),
         // so that no dispatch casts more than RAYS_PER_DISPATCH rays.
-        let subsets = queries.par_iter().map(|q| q.subsets).max().unwrap_or(1).max(1);
         let fewest_subsets = queries.par_iter().map(|q| q.subsets).min().unwrap_or(1).max(1);
         let passes: Vec<Pass> = passes
             .iter()
             .map(|h| {
-                let (lanes, per_dispatch) = hemisphere_sizes(h.rays, (fewest_subsets, subsets));
+                let (lanes, per_dispatch) = hemisphere_sizes(h.rays, (fewest_subsets, h.subsamples));
                 let flags =
                     [(h.uniform, UNIFORM), (h.ground_height.is_some(), 8), (h.same_key, SAME_KEY)].iter().filter(|(on, _)| *on).fold(0, |f, (_, b)| f | b);
                 let params = Params {
@@ -428,6 +428,7 @@ mod tests {
     use texturecraft_geom::{Bvh, Mesh, primitives};
 
     use super::*;
+    use texturecraft_bake::tracing::CpuTracer;
 
     /// However a batch mixes fully and partly covered antialiased texels, no hemisphere dispatch casts
     /// more than RAYS_PER_DISPATCH rays (the driver-watchdog bound), and unsplit queries are sized as
@@ -445,19 +446,12 @@ mod tests {
         }
     }
 
-    /// Query by query, the GPU tracer returns what the CPU tracer does for every share of a texel's
-    /// rays (a query casts rays subset, subset + subsets, …), whole texels mixed into the same batch.
-    /// A bake-level comparison averages shares away; this catches a shader that walks the wrong rays.
-    #[test]
-    fn gpu_hemisphere_queries_match_the_cpu_share_by_share() {
-        use texturecraft_bake::tracing::{ANY, CpuTracer, Hemisphere, Query, RayKind, TraceMesh, Tracer};
-        let Some(baker) = gpu() else { return };
-        let ball = primitives::material_ball();
-        let bvh = Bvh::new(&ball);
-        let meshes = [TraceMesh { mesh: &ball, bvh: &bvh, keys: &[], backface_culling: &[] }];
+    /// Probe passes for a bake whose texels split their rays into at most `subsamples` shares.
+    fn probe_passes(subsamples: u32) -> [Hemisphere; 2] {
         let pass = |kind, rays| Hemisphere {
             kind,
             rays,
+            subsamples,
             dmax: 0.5,
             min_distance: 1e-5,
             attenuation: AmbientOcclusionAttenuation::Linear,
@@ -469,11 +463,15 @@ mod tests {
             ignore_backface: BackfaceMode::Never,
             same_key: false,
         };
-        let passes = [pass(RayKind::Occlusion, 64), pass(RayKind::Thickness, 16)];
-        // Triangle centres; every other one leans its shading normal so that some shares lose every ray
-        let queries: Vec<Query> = (0..ball.triangle_count())
+        [pass(RayKind::Occlusion, 64), pass(RayKind::Thickness, 16)]
+    }
+
+    /// Every share of 1, 3, 4, 16 and 64 of the rays at some triangle centres of `mesh`; every other
+    /// centre leans its shading normal so that some shares lose every ray.
+    fn probe_queries(mesh: &Mesh) -> Vec<Query> {
+        (0..mesh.triangle_count())
             .step_by(211)
-            .filter_map(|t| ball.tri(t).map(|corners| corners.map(|v| ball.positions.get(v).copied().unwrap_or_default())))
+            .filter_map(|t| mesh.tri(t).map(|corners| corners.map(|v| mesh.positions.get(v).copied().unwrap_or_default())))
             .enumerate()
             .flat_map(|(i, [a, b, c])| {
                 let geo = (b - a).cross(c - a).normalize_or_zero();
@@ -482,7 +480,19 @@ mod tests {
                 let query = |(subset, subsets)| Query { pos: (a + b + c) / 3.0, nrm, geo, rot, key: ANY, mesh: 0, subset, subsets };
                 [1u32, 3, 4, 16, 64].into_iter().flat_map(|subsets| (0..subsets).map(move |subset| (subset, subsets))).map(query).collect::<Vec<_>>()
             })
-            .collect();
+            .collect()
+    }
+
+    /// Query by query, the GPU tracer returns what the CPU tracer does for every share of a texel's
+    /// rays (a query casts rays subset, subset + subsets, …), whole texels mixed into the same batch.
+    /// A bake-level comparison averages shares away; this catches a shader that walks the wrong rays.
+    #[test]
+    fn gpu_hemisphere_queries_match_the_cpu_share_by_share() {
+        let Some(baker) = gpu() else { return };
+        let ball = primitives::material_ball();
+        let bvh = Bvh::new(&ball);
+        let meshes = [TraceMesh { mesh: &ball, bvh: &bvh, keys: &[], backface_culling: &[] }];
+        let (passes, queries) = (probe_passes(64), probe_queries(&ball));
         let cpu = CpuTracer.scene(&meshes).unwrap().hemispheres(&passes, &queries).unwrap();
         let gpu = baker.scene(&meshes).unwrap().hemispheres(&passes, &queries).unwrap();
         assert_eq!((cpu.len(), gpu.len()), (passes.len(), passes.len()));
@@ -498,6 +508,26 @@ mod tests {
             }
         }
         assert!(empty_shares > 0, "no share lost every ray: the test misses that case");
+    }
+
+    /// A query's GPU result does not depend on the batch it is traced in: a batch of only edge
+    /// texels' large shares (as a run of thin UV slivers gives) returns the same bytes as when those
+    /// queries share a batch with fully covered texels.
+    #[test]
+    fn gpu_hemisphere_results_do_not_depend_on_batching() {
+        let Some(baker) = gpu() else { return };
+        let ball = primitives::material_ball();
+        let bvh = Bvh::new(&ball);
+        let meshes = [TraceMesh { mesh: &ball, bvh: &bvh, keys: &[], backface_culling: &[] }];
+        let passes = probe_passes(64);
+        let (edge, full): (Vec<Query>, Vec<Query>) = probe_queries(&ball).into_iter().partition(|query| query.subsets <= 4);
+        let mixed: Vec<Query> = edge.iter().chain(&full).copied().collect();
+        let mut scene = baker.scene(&meshes).unwrap();
+        let (alone, together) = (scene.hemispheres(&passes, &edge).unwrap(), scene.hemispheres(&passes, &mixed).unwrap());
+        let bits = |results: &[[f32; 4]]| results.iter().map(|value| value.map(f32::to_bits)).collect::<Vec<_>>();
+        for ((pass, alone), together) in passes.iter().zip(&alone).zip(&together) {
+            assert!(bits(alone) == bits(together.get(..edge.len()).unwrap()), "{:?}: a batch of edge shares changed their results", pass.kind);
+        }
     }
 
     /// A write that fails while a batch uploads on worker threads is reported (wgpu's error scopes
