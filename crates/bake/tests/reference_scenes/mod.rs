@@ -565,6 +565,11 @@ pub fn opacity_of_a_hole(tracer: &dyn Tracer) {
         let partial = texels.iter().filter(|t| (0.01..0.99).contains(&scalar(&output, BakedMap::Opacity, t.index))).count();
         eprintln!("opacity of a hole, {antialiasing:?}: worst error {worst:.2e}, {partial} partial texels");
         assert!(worst < 1e-6, "opacity {antialiasing:?} off by {worst}");
+        // In texels the hole spans x 8.25..20.5 and z 12.75..23.75: at 4 × 4 its edges cut the
+        // border of a 13 × 12 block of texels, 2 · 13 + 2 · 12 − 4 = 46, and one sample per
+        // texel never gives a partial value
+        let expected_partial = if antialiasing == BakeAntialiasing::None { 0 } else { 46 };
+        assert_eq!(partial, expected_partial, "opacity {antialiasing:?}: partly covered texels");
     }
 }
 
@@ -940,7 +945,10 @@ fn locate(mesh: &Mesh, triangles: std::ops::Range<u32>, uv: Vec2) -> Option<(u32
 /// along y are at most 0.03 units (the rotated half: 2 units over 0.4 · 256 texels), so the two
 /// sides may differ by 2 · 0.64 · 0.03 rad ≈ 2.2°. The world-space normal also turns with θ: 1.5
 /// texels are at most 1.5 π / (0.4 · 256) rad ≈ 2.6° on the narrower half and 1.3° on the other,
-/// plus the same 2.2° along y.
+/// 3.9° between the sides, plus the same 2.2° along y. The θ error turns the normal about the
+/// y axis and the y error about the circumferential tangent, perpendicular axes, so for these
+/// small angles they add in quadrature: √(3.9² + 2.2²) ≈ 4.5°, inside the 5° budget (their plain
+/// sum, 6.1°, would not be).
 pub fn tangent_normals_agree_across_a_uv_seam(tracer: &dyn Tracer) {
     let low = split_cylinder();
     let high = ringed_tube();
