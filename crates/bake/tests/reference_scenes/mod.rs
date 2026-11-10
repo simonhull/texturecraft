@@ -614,6 +614,10 @@ fn to_world((t, b, n): (Vec3, Vec3, Vec3), tangent_space: Vec3) -> Vec3 {
 /// The baked normal as the viewport reads it. `compose::display::tile_bytes` re-orients the
 /// (flat) painted normal onto the baked one with `core::blend::rnm` and stores
 /// `(v · 255 + 0.5) as u8`; the shader's `snorm8` reads that byte as `(byte − 128) / 127`.
+///
+/// This models the display's unsigned packing from before #278 (which moves to signed bytes
+/// around 128) by copying it rather than calling it, so a change to that packing must be
+/// mirrored here.
 fn viewport_tangent_normal(baked: Vec3) -> Vec3 {
     let shown = texturecraft_core::blend::rnm(baked.to_array(), [0.5, 0.5, 1.0]);
     let byte = |v: f32| f32::from((v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
@@ -661,10 +665,13 @@ fn percentiles(mut angles: Vec<f32>) -> [f32; 3] {
 /// must be the high-poly normal the transfer ray hit.
 ///
 /// Float decoding isolates the conventions: the bake and the viewport build the same frame, so
-/// the error is rounding. The 8-bit display path adds quantization and a bias: the display
-/// stores `round(255 (½ + ½x))` = `127.5 (1 + x) ± ½` and the shader's `snorm8` reads it as
-/// `(byte − 128) / 127` = `1.004 x − 0.004 ± 0.004`, so each component is off by at most
-/// 0.0079 and the decoded direction by at most √3 · 0.0079 rad ≈ 0.78°.
+/// the error is rounding. The 8-bit display path adds quantization and a bias: for a component
+/// c the display stores `round(255 (½ + ½c))` = `127.5 (1 + c) + e` with |e| ≤ ½, and the
+/// shader's `snorm8` reads it as `(byte − 128) / 127` = `c + (c/2 + e − ½) / 127`, off by at
+/// most `(1 − c/2) / 127`: 0.0079 at c = 0, growing to 0.0118 as c falls towards −1. Where the
+/// high poly tilts at most θ from the low normal, |x|, |y| ≤ sin θ and z ≥ cos θ, so the error
+/// vector is at most `ε = √(2 (1 + ½ sin θ)² + (1 − ½ cos θ)²) / 127` long and turns the decoded
+/// direction by at most `asin(ε / (1 − ε))`: 0.77° for θ = 15°. The float error adds to that.
 ///
 /// Triangles whose vertices disagree on the bitangent sign are reported apart: the bake takes
 /// the sign of their first vertex, the viewport interpolates it (see
@@ -710,17 +717,23 @@ fn round_trip(tracer: &dyn Tracer, low: &Mesh, label: &str) {
             .collect(),
     );
     let mixed_max = mixed_errors.iter().copied().fold(0.0, f32::max);
+    // The 8-bit maximum is derived (see above) from the measured tilt, widened by the float error
+    let (sin, cos) = (tilt[2] + float_max).to_radians().sin_cos();
+    let epsilon = (2.0 * (1.0 + 0.5 * sin).powi(2) + (1.0 - 0.5 * cos).powi(2)).sqrt() / 127.0;
+    let max_bound = (epsilon / (1.0 - epsilon)).asin().to_degrees() + float_max;
     eprintln!(
-        "normal round trip ({label}, {} texels, {missed} missed, bump tilt p50 {:.1}° max {:.1}°): float p50 {float_p50:.4}° p99 {float_p99:.4}° max {float_max:.4}°; 8-bit p50 {p50:.3}° p99 {p99:.3}° max {max:.3}°; {} texels on mixed-sign triangles, float max {mixed_max:.3}°",
+        "normal round trip ({label}, {} texels, {missed} missed, bump tilt p50 {:.1}° max {:.1}°): float p50 {float_p50:.4}° p99 {float_p99:.4}° max {float_max:.4}°; 8-bit p50 {p50:.3}° p99 {p99:.3}° max {max:.3}° (bound {max_bound:.3}°); {} texels on mixed-sign triangles, float max {mixed_max:.3}°",
         float_errors.len(),
         tilt[0],
         tilt[2],
         mixed_errors.len(),
     );
     assert_eq!(missed, 0, "{label}: transfer rays that found no high poly");
-    // Single-precision rounding of hit points, frames and the 0..1 packing: far below 0.1°
+    // Single-precision rounding of hit points, frames and the 0..1 packing. These limits, and the
+    // 8-bit p50 and p99 below, are fitted to the measured errors with some margin, not derived.
     assert!(float_p99 < 0.05 && float_max < 0.1, "{label}: float decoding p99 {float_p99}°, max {float_max}°");
-    assert!(p50 < 0.45 && p99 < 0.75 && max < 0.8, "{label}: 8-bit decoding p50 {p50}°, p99 {p99}°, max {max}°");
+    assert!(p50 < 0.45 && p99 < 0.75, "{label}: 8-bit decoding p50 {p50}°, p99 {p99}°");
+    assert!(max < max_bound, "{label}: 8-bit decoding max {max}° (bound {max_bound}°)");
 }
 
 /// Whether the vertices of `triangle` disagree on the bitangent sign
