@@ -16,7 +16,7 @@
 //! Normals are signed: Normal packs the tangent-space normal's x, y and z, and Extra the coat
 //! normal's x and y, as `128 + 127 × n` (see [`snorm8`]), which the shaders read back as
 //! `(byte − 128) / 127`. The flat normal packs exactly (128, 128, 255); the coat's z is rebuilt in
-//! the shader. Its alpha is the [`Composite::block_scales`] of the texel's UV
+//! the shader. Extra's alpha is the [`Composite::block_scales`] of the texel's UV
 //! tile as `32 × log2(1 / scale)` (0 for a tile filling its block): the shader turns height
 //! slopes down by it.
 //!
@@ -103,6 +103,14 @@ pub fn snorm8(v: f32) -> u8 {
     (128.0 + 127.0 * (v * 2.0 - 1.0)).round().clamp(0.0, 255.0) as u8
 }
 
+/// [`snorm8`] of a 16-bit channel value (`v / 65535`) in integer arithmetic:
+/// `round(1 + 254 v / 65535)`, the same byte without three float roundings per texel, which
+/// doubled the cost of packing a painted normal tile.
+pub fn snorm8_u16(v: u16) -> u8 {
+    // 254 × 65535 + 32767 fits in u32, and the quotient is at most 254
+    ((254 * u32::from(v) + 32767) / 65535 + 1) as u8
+}
+
 /// Tile bytes (`TILE × TILE`, row-major) for `kind`, using channel defaults for absent source tiles.
 pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, tx: u32, ty: u32) -> Vec<u8> {
     let bytes_per_texel = kind.bytes_per_texel();
@@ -155,7 +163,7 @@ pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, t
             let scale = (-32.0 * composite.block_scales.at(tx * TILE, ty * TILE).log2()).round().clamp(0.0, 255.0) as u8;
             for (i, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 for (k, d) in pixel.iter_mut().take(2).enumerate() {
-                    *d = n.and_then(|t| t.get(i * 3 + k)).map_or(128, |v| snorm8(texturecraft_texel::from_u16(*v)));
+                    *d = n.and_then(|t| t.get(i * 3 + k)).map_or(128, |v| snorm8_u16(*v));
                 }
                 pixel[2] = transmission(i);
                 pixel[3] = scale;
@@ -188,14 +196,20 @@ pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, t
                 // The baked normal is the base the painted normal details sit on (as in export)
                 let (x, y) = (tx * TILE + (i as u32 % TILE), ty * TILE + (i as u32 / TILE));
                 let base = baked.sample_working(BakedMap::Normal, x, y, (resolution, composite.height), &composite.block_scales);
-                let painted = |t: &[u16]| [0, 1, 2].map(|k| t.get(i * 3 + k).map_or(0.0, |v| texturecraft_texel::from_u16(*v)));
-                let shown = match (n, base) {
-                    (Some(t), None) => painted(t),
-                    (detail, Some(base)) => texturecraft_core::blend::rnm(base, detail.map_or([0.5, 0.5, 1.0], painted)),
-                    (None, None) => [0.5, 0.5, 1.0],
-                };
-                for (d, v) in pixel.iter_mut().zip(shown) {
-                    *d = snorm8(v);
+                match (n, base) {
+                    (Some(t), None) => {
+                        for (k, d) in pixel.iter_mut().take(3).enumerate() {
+                            *d = snorm8_u16(t.get(i * 3 + k).copied().unwrap_or(0));
+                        }
+                    }
+                    (detail, Some(base)) => {
+                        let painted = |t: &[u16]| [0, 1, 2].map(|k| t.get(i * 3 + k).map_or(0.0, |v| texturecraft_texel::from_u16(*v)));
+                        let shown = texturecraft_core::blend::rnm(base, detail.map_or([0.5, 0.5, 1.0], painted));
+                        for (d, v) in pixel.iter_mut().zip(shown) {
+                            *d = snorm8(v);
+                        }
+                    }
+                    (None, None) => pixel[..3].copy_from_slice(&[snorm8(0.5), snorm8(0.5), snorm8(1.0)]),
                 }
                 pixel[3] = sheen_roughness(i);
             }
@@ -315,6 +329,18 @@ mod tests {
                 assert!(degrees <= (3f32.sqrt() * step).asin().to_degrees(), "{label}: normal {n:?} decodes {degrees}° off");
             }
         }
+    }
+
+    /// The integer packing of every 16-bit value is the float packing exactly rounded (f32 can
+    /// round a value a hair under one half up, so it may differ by one there).
+    #[test]
+    fn snorm8_u16_is_snorm8_of_the_channel_value() {
+        for v in 0..=u16::MAX {
+            let exact = 1.0 + 254.0 * f64::from(v) / 65535.0;
+            assert_eq!(f64::from(snorm8_u16(v)), exact.round(), "{v}");
+            assert!(snorm8_u16(v).abs_diff(snorm8(texturecraft_texel::from_u16(v))) <= 1, "{v}");
+        }
+        assert_eq!((snorm8_u16(0), snorm8_u16(32768), snorm8_u16(u16::MAX)), (1, 128, 255));
     }
 
     #[test]
