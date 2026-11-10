@@ -1279,9 +1279,10 @@ fn antialiasing_splits_each_texels_rays_between_its_subsamples() {
 }
 
 #[test]
-fn antialiased_batches_hold_as_many_texels_as_unantialiased_ones() {
+fn antialiased_batches_hold_more_subsamples_up_to_a_cap() {
     // With split rays an antialiased subsample casts few; small batches would leave the GPU idle
-    // between them. The quad covers every subsample: 2^18 texels at 512², 2^20 subsamples at 2×2.
+    // between them. A batch holds 2^18 texels' subsamples up to 2^20 of them: all 2^18 texels at
+    // 2×2, 2^16 at 4×4 and 2^14 at 8×8. The quad covers every subsample.
     let m = quad();
     let s = with_rays(settings(512, &[BakedMap::AmbientOcclusion]), 4, 0.25);
     for (s, subsamples) in [(s.clone(), 1 << 18), (antialiased(s, BakeAntialiasing::Subsampling2x2), 1 << 20)] {

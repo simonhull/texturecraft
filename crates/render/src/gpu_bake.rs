@@ -22,6 +22,7 @@ const WORKGROUP: u32 = 64;
 const RAYS_PER_DISPATCH: usize = 1 << 24;
 const NONE: u32 = u32::MAX;
 /// Fewest items per parallel write when uploading a batch.
+/// Every write has its own staging allocation in wgpu, so 2^12 (128-256 KiB of rows) keeps them few and large.
 const FILL_CHUNK: usize = 1 << 12;
 const UNIFORM: u32 = 1;
 const IGNORE_BACKFACE: u32 = 2;

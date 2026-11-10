@@ -45,10 +45,12 @@ pub const MAX_TEXELS: u64 = 1 << 27;
 const STRIP_TEXELS: usize = 1 << 24;
 const BATCH: usize = 1 << 18;
 // Antialiased batches cover up to 2^18 texels in at most this many subsamples
+// (2^20 gives 2×2 the texels of an unantialiased batch, and keeps a batch's GPU buffers under 200 MiB: 64 B of query row and up to 96 B of results and staging per subsample)
 const AA_BATCH: usize = 1 << 20;
 // Curvature batches stay small so progress and cancellation remain responsive
 const CURVATURE_BATCH: usize = 1 << 15;
 // Subsamples per parallel span of a batch (see `span_texels`)
+// (2^12 is enough work per task to outweigh scheduling, and still splits a batch of 2^20 into 256 spans for every core)
 const SPAN_SAMPLES: usize = 1 << 12;
 
 fn validate(request: &BakeRequest) -> Result<(), BakeError> {
