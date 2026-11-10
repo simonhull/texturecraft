@@ -178,9 +178,13 @@ impl Mesh {
     /// then build the same frame. Copies keep the vertex's position, normal, UV and color, so
     /// nothing but the vertex count changes.
     ///
-    /// A zero-area triangle can still get corners of both signs: a vertex no other triangle
-    /// uses gets MikkTSpace's fallback frame (w = −1), e.g. at a UV sphere's pole on the seam.
-    /// Such corners take the sign of the triangle's first corner.
+    /// A triangle MikkTSpace cannot orient can still get corners of both signs: one with two
+    /// corners at the same position (a UV sphere's pole triangle on the seam), or one with area
+    /// whose UVs collapse onto a line or a point. Each of its corners carries the frame of a
+    /// neighbour that reaches it, or, where none does, MikkTSpace's initial frame (w = −1),
+    /// which says nothing about the surface. All its corners take the sign most of its reached
+    /// corners carry (the first reached corner's on a tie), so a vertex it shares with an
+    /// oriented neighbour keeps that neighbour's sign and is not split.
     pub fn compute_tangents(&mut self) {
         self.tangents = vec![Vec4::new(1.0, 0.0, 0.0, 1.0); self.positions.len()];
         if self.normals.len() != self.positions.len() {
@@ -191,13 +195,12 @@ impl Mesh {
         }
         // mikktspace crashes (out-of-bounds) when every triangle is degenerate; skip it then.
         let usable = !crate::unwrap::all_triangles_degenerate(self);
-        let mut g = Mikk { mesh: self, corners: vec![None; self.indices.len()] };
+        let mut g = Mikk { mesh: self, corners: vec![UNTOUCHED_CORNER; self.indices.len()], reached: vec![false; self.indices.len()] };
         if usable && mikktspace::generate_tangents(&mut g) {
-            let mut corners = g.corners;
-            for triangle in corners.as_chunks_mut::<3>().0 {
-                if let Some(Some(first)) = triangle.first().copied() {
-                    triangle.iter_mut().flatten().for_each(|t| t.w = first.w);
-                }
+            let (mut corners, reached) = (g.corners, g.reached);
+            for (triangle, reached) in corners.as_chunks_mut::<3>().0.iter_mut().zip(reached.as_chunks::<3>().0) {
+                let w = triangle_sign(triangle, reached);
+                triangle.iter_mut().for_each(|t| t.w = w);
             }
             self.split_by_corner_tangents(&corners);
         } else {
@@ -212,13 +215,12 @@ impl Mesh {
     }
 
     /// Give every index its corner's tangent: the first corner of a vertex sets its tangent,
-    /// and each further distinct tangent gets a copy of the vertex. Corners without a tangent
-    /// keep their vertex.
-    fn split_by_corner_tangents(&mut self, corners: &[Option<Vec4>]) {
+    /// and each further distinct tangent gets a copy of the vertex.
+    fn split_by_corner_tangents(&mut self, corners: &[Vec4]) {
         let mut first: Vec<Option<Vec4>> = vec![None; self.positions.len()];
         let mut copies: std::collections::HashMap<(u32, [u32; 4]), u32> = std::collections::HashMap::new();
         for (k, tangent) in corners.iter().enumerate() {
-            let (Some(tangent), Some(&v)) = (tangent, self.indices.get(k)) else { continue };
+            let Some(&v) = self.indices.get(k) else { continue };
             let Some(seen) = first.get_mut(v as usize) else { continue };
             let vertex = match seen {
                 None => {
@@ -395,10 +397,43 @@ impl Mesh {
     }
 }
 
+/// The tangent frame mikktspace 0.3 gives a corner it never reaches (`genTangSpace` fills its
+/// frames with this before grouping): tangent +X, bitangent +Y, both magnitudes 1, not
+/// orientation preserving, so w = −1. A reached corner can carry exactly this frame too (a face
+/// along the axes, UVs at unit scale and wound clockwise); it then counts as unreached, which
+/// can only matter in a triangle whose other reached corners disagree on the sign.
+const UNTOUCHED_TANGENT: [f32; 3] = [1.0, 0.0, 0.0];
+/// The untouched frame's bitangent; see [`UNTOUCHED_TANGENT`].
+const UNTOUCHED_BITANGENT: [f32; 3] = [0.0, 1.0, 0.0];
+/// The untouched frame's tangent and bitangent magnitudes; see [`UNTOUCHED_TANGENT`].
+const UNTOUCHED_MAGNITUDE: f32 = 1.0;
+/// The untouched frame as `set_tangent_encoded` would see it.
+const UNTOUCHED_CORNER: Vec4 = Vec4::new(1.0, 0.0, 0.0, -1.0);
+
+/// The bitangent sign all corners of a triangle take: the sign most of the corners MikkTSpace
+/// reached carry (the first reached corner's on a tie), or the first corner's when it reached
+/// none. Only a triangle MikkTSpace cannot orient (two corners at one position, or collapsed
+/// UVs) mixes signs; its unreached corners carry the initial w = −1, which says nothing about
+/// its neighbours.
+fn triangle_sign(corners: &[Vec4; 3], reached: &[bool; 3]) -> f32 {
+    let [first, ..] = corners;
+    let mut signs = corners.iter().zip(reached).filter(|(_, r)| **r).map(|(t, _)| t.w);
+    let Some(first_reached) = signs.next() else { return first.w };
+    let vote = |w: f32| if w < 0.0 { -1 } else { 1 };
+    match (signs.map(vote).sum::<i32>() + vote(first_reached)).cmp(&0) {
+        std::cmp::Ordering::Greater => 1.0,
+        std::cmp::Ordering::Less => -1.0,
+        std::cmp::Ordering::Equal => first_reached,
+    }
+}
+
 /// MikkTSpace's view of a mesh; it writes each triangle corner's tangent to `corners`.
 struct Mikk<'a> {
     mesh: &'a Mesh,
-    corners: Vec<Option<Vec4>>,
+    /// Each triangle corner's tangent, w the bitangent sign (16 bytes per corner)
+    corners: Vec<Vec4>,
+    /// Whether MikkTSpace gave the corner a frame (false: it kept the untouched one)
+    reached: Vec<bool>,
 }
 
 impl Mikk<'_> {
@@ -426,9 +461,19 @@ impl mikktspace::Geometry for Mikk<'_> {
         let uv = self.mesh.uvs.get(self.vi(face, vert)).copied().unwrap_or_default();
         [uv.x, 1.0 - uv.y]
     }
-    fn set_tangent_encoded(&mut self, tangent: [f32; 4], face: usize, vert: usize) {
-        if let Some(t) = face.checked_mul(3).and_then(|k| k.checked_add(vert)).and_then(|k| self.corners.get_mut(k)) {
-            *t = Some(Vec4::from_array(tangent));
+    /// Record the corner's tangent with its sign, and whether MikkTSpace reached it.
+    fn set_tangent(&mut self, tangent: [f32; 3], bi_tangent: [f32; 3], f_mag_s: f32, f_mag_t: f32, preserves_orientation: bool, face: usize, vert: usize) {
+        let Some(k) = face.checked_mul(3).and_then(|k| k.checked_add(vert)) else { return };
+        if let Some(t) = self.corners.get_mut(k) {
+            *t = Vec3::from_array(tangent).extend(if preserves_orientation { 1.0 } else { -1.0 });
+        }
+        let untouched = tangent == UNTOUCHED_TANGENT
+            && bi_tangent == UNTOUCHED_BITANGENT
+            && f_mag_s == UNTOUCHED_MAGNITUDE
+            && f_mag_t == UNTOUCHED_MAGNITUDE
+            && !preserves_orientation;
+        if let Some(r) = self.reached.get_mut(k) {
+            *r = !untouched;
         }
     }
 }
@@ -479,13 +524,60 @@ mod tests {
         Mesh { indices, ..mesh.clone() }
     }
 
-    /// MikkTSpace's tangent for every triangle corner of `mesh`
-    fn mikktspace_corners(mesh: &Mesh) -> Vec<Vec4> {
-        let mut g = Mikk { mesh, corners: vec![None; mesh.indices.len()] };
+    /// MikkTSpace's tangent for every triangle corner of `mesh`, and whether it reached the corner
+    fn mikktspace_frames(mesh: &Mesh) -> (Vec<Vec4>, Vec<bool>) {
+        let mut g = Mikk { mesh, corners: vec![UNTOUCHED_CORNER; mesh.indices.len()], reached: vec![false; mesh.indices.len()] };
         assert!(mikktspace::generate_tangents(&mut g));
-        g.corners.into_iter().map(Option::unwrap).collect()
+        (g.corners, g.reached)
     }
 
+    /// MikkTSpace's tangent for every triangle corner of `mesh`
+    fn mikktspace_corners(mesh: &Mesh) -> Vec<Vec4> {
+        mikktspace_frames(mesh).0
+    }
+
+    /// A triangle A = (0, 1, 2) with real UVs, and two triangles with area whose UVs collapse
+    /// onto the line v = 0.5: C1 = (3, 1, 0) shares A's edge 0-1, C2 = (0, 4, 3) shares C1's
+    /// edge 0-3. MikkTSpace reaches C1 at 0 and 1 (from A) and C2 at 0 only; vertices 3 and 4
+    /// belong to no triangle it can orient. A's UVs keep their orientation, so A has w = +1,
+    /// the opposite of the untouched corners' w = −1: C1's first corner is untouched, and C2's
+    /// only reached corner is its first.
+    fn collapsed_uv_fan() -> Mesh {
+        let positions = vec![Vec3::ZERO, Vec3::X, Vec3::Z, Vec3::new(0.5, 0.0, -1.0), Vec3::new(-1.0, 0.0, -0.5)];
+        let uvs = vec![Vec2::new(0.0, 0.5), Vec2::new(0.5, 0.5), Vec2::new(0.0, 0.0), Vec2::new(0.25, 0.5), Vec2::new(0.75, 0.5)];
+        Mesh::from_parts(positions, Some(vec![Vec3::Y; 5]), uvs, vec![0, 1, 2, 3, 1, 0, 0, 4, 3], "Fan").unwrap()
+    }
+
+    /// Triangles with area but collapsed UVs take the sign MikkTSpace gave their reached
+    /// corners, whichever corner comes first and however many corners it left untouched, so
+    /// no vertex they share with a real triangle is split and no polygon diagonal shows.
+    #[test]
+    fn collapsed_uv_triangles_take_their_reached_corners_sign() {
+        let m = collapsed_uv_fan();
+        let (raw, reached) = mikktspace_frames(&m);
+        assert_eq!(raw.iter().map(|t| t.w).collect::<Vec<_>>(), [1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0], "MikkTSpace mixes C1 and C2");
+        assert_eq!(reached, [true, true, true, false, true, true, true, false, false]);
+        assert!(m.indices.iter().all(|v| m.tangents[*v as usize].w == 1.0), "every corner takes A's sign: {:?}", m.tangents);
+        assert_eq!(m.vertex_count(), 5, "no vertex is split");
+        let mut shown = m.clone();
+        shown.diagonals = vec![0b001, 0b010, 0];
+        assert!(!shown.wire_edges()[0].contains(&(0, 1)), "the diagonal A and C1 share stays hidden");
+    }
+
+    /// The sign of most reached corners wins, the first reached one on a tie; untouched
+    /// corners count only when no corner was reached.
+    #[test]
+    fn triangle_sign_follows_the_reached_corners() {
+        let t = |w: f32| Vec4::new(1.0, 0.0, 0.0, w);
+        assert_eq!(triangle_sign(&[t(-1.0), t(1.0), t(1.0)], &[false, true, true]), 1.0);
+        assert_eq!(triangle_sign(&[t(1.0), t(-1.0), t(-1.0)], &[true, false, false]), 1.0);
+        assert_eq!(triangle_sign(&[t(-1.0), t(1.0), t(-1.0)], &[true, true, true]), -1.0);
+        assert_eq!(triangle_sign(&[t(-1.0), t(1.0), t(-1.0)], &[false, true, true]), 1.0);
+        assert_eq!(triangle_sign(&[t(1.0), t(-1.0), t(-1.0)], &[false, false, false]), 1.0);
+    }
+
+    /// After `compute_tangents`, every triangle corner of a bowtie with a mirrored half and of a
+    /// UV sphere carries MikkTSpace's own frame for that corner, and no triangle mixes signs.
     #[test]
     fn every_triangle_corner_keeps_its_mikktspace_frame() {
         for (name, split) in [("bowtie", bowtie()), ("UV sphere", crate::primitives::sphere(1.0, 32, 16))] {
