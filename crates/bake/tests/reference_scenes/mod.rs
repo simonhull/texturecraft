@@ -44,6 +44,7 @@ pub const CHECKS: [(&str, Check); 12] = [
 // ---------------------------------------------------------------------------------------------
 // Baking and sampling helpers
 
+/// Bake settings at `resolution`² for `maps`, with no dilation or diffusion so every texel is a raw bake value
 fn settings(resolution: u32, antialiasing: BakeAntialiasing, maps: &[BakedMap]) -> BakeSettings {
     let mut settings = BakeSettings::default();
     settings.common.resolution = BakeResolution::from_pixels(resolution).unwrap();
@@ -66,6 +67,7 @@ fn cage(settings: &mut BakeSettings, frontal: f32, rear: f32) {
     settings.cage.relative_to_bounding_box = false;
 }
 
+/// Bake `low` (and `high`, if any) on `tracer`, failing if the tracer fell back to the CPU
 fn bake_with(tracer: &dyn Tracer, low: &Mesh, high: Option<&Mesh>, settings: &BakeSettings) -> BakeOutput {
     let low_bvh = Bvh::new(low);
     let high_bvh = high.map(Bvh::new);
@@ -87,15 +89,18 @@ struct Texel {
 }
 
 impl Texel {
+    /// Mean of `value` over the texel's covered subsamples
     fn mean(&self, value: impl Fn(&Surface) -> f32) -> f32 {
         self.surfaces.iter().map(value).sum::<f32>() / self.surfaces.len() as f32
     }
 
+    /// Mean of the vector `value` over the texel's covered subsamples
     fn mean_vector(&self, value: impl Fn(&Surface) -> Vec3) -> Vec3 {
         self.surfaces.iter().map(value).sum::<Vec3>() / self.surfaces.len() as f32
     }
 }
 
+/// Every texel of material 0 that has at least one covered subsample, with those subsamples' surfaces
 fn texels(mesh: &Mesh, resolution: u32, antialiasing: BakeAntialiasing) -> Vec<Texel> {
     let (size, per_axis) = (resolution as usize, antialiasing.samples_per_axis() as usize);
     let fine = UvGBuffer::new(mesh, 0, (size * per_axis) as u32, (size * per_axis) as u32);
@@ -110,22 +115,27 @@ fn texels(mesh: &Mesh, resolution: u32, antialiasing: BakeAntialiasing) -> Vec<T
         .collect()
 }
 
+/// The first component of `map` at texel `index`
 fn scalar(output: &BakeOutput, map: BakedMap, index: usize) -> f32 {
     output.maps[&map][index * map.components()]
 }
 
+/// The three components of `map` at texel `index`
 fn vector(output: &BakeOutput, map: BakedMap, index: usize) -> Vec3 {
     Vec3::from_slice(&output.maps[&map][index * 3..index * 3 + 3])
 }
 
+/// A packed 0..1 vector back in −1..1
 fn unpack(packed: Vec3) -> Vec3 {
     packed * 2.0 - Vec3::ONE
 }
 
+/// A −1..1 vector packed into 0..1, as the baker stores normals
 fn pack(normal: Vec3) -> Vec3 {
     normal * 0.5 + Vec3::splat(0.5)
 }
 
+/// The angle between two directions, in degrees
 fn degrees_between(a: Vec3, b: Vec3) -> f32 {
     a.normalize().dot(b.normalize()).clamp(-1.0, 1.0).acos().to_degrees()
 }
@@ -278,9 +288,11 @@ pub fn occlusion_beside_a_wall(tracer: &dyn Tracer) {
     }
 }
 
-/// Floor `-1..1` square (baked) inside four walls of height `BOX_HEIGHT` facing inwards, no lid
+/// Height of the open box's walls
 const BOX_HEIGHT: f32 = 1.0;
 
+/// The open box scene: a floor `-1..1` square (material 0, baked) inside four walls of height
+/// `BOX_HEIGHT` facing inwards (materials 1 to 4, not baked), no lid
 fn open_box() -> Mesh {
     let mut mesh = floor([-1.0, 1.0], [-1.0, 1.0], 0.0, |x, z| Vec2::new((x + 1.0) * 0.5, (z + 1.0) * 0.5));
     let h = BOX_HEIGHT;
@@ -368,6 +380,7 @@ pub fn occlusion_inside_an_open_box(tracer: &dyn Tracer) {
 // ---------------------------------------------------------------------------------------------
 // Height
 
+/// Height-map settings with `normalization` and a scaling divisor of 1
 fn height_settings(resolution: u32, normalization: HeightNormalization) -> BakeSettings {
     let mut settings = settings(resolution, BakeAntialiasing::None, &[BakedMap::Height]);
     settings.maps.height.parameters.normalization = normalization;
@@ -515,8 +528,10 @@ pub fn thickness_of_a_slab(tracer: &dyn Tracer) {
         settings.maps.thickness.parameters.self_occlusion = SelfOcclusion::Always;
         let output = bake_with(tracer, &slab, None, &settings);
         let measured = top.iter().map(|t| scalar(&output, BakedMap::Thickness, t.index)).sum::<f32>() / top.len() as f32;
-        // A ray's distance lies in [T, min(T / C, D)]: variance ≤ (range / 2)²
-        let range = (T / cone.max(T / max_distance)).min(max_distance) - T;
+        // A ray's distance lies in [T, min(T / C, D)], C the cosine of this case's half angle
+        // (0 for the hemisphere, where the cap D bounds it): variance ≤ (range / 2)²
+        let case_cone = (spread * 0.5f32).to_radians().cos();
+        let range = (T / case_cone.max(T / max_distance)).min(max_distance) - T;
         let tolerance = four_sigma((range * 0.5).powi(2), RAYS as usize * top.len());
         eprintln!("slab thickness, {spread}° {distribution:?}: {measured:.4} vs {expected:.4} (±{tolerance:.4}) over {} texels", top.len());
         assert!((measured - expected).abs() < tolerance, "slab thickness {spread}° {distribution:?}: {measured} vs {expected}");

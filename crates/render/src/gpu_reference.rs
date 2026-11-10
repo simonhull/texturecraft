@@ -39,6 +39,7 @@ fn gpu() -> Option<GpuBaker> {
     }
 }
 
+/// Every reference scene on the GPU tracer (skipped without an adapter)
 #[test]
 fn gpu_bakes_the_reference_scenes() {
     let Some(gpu) = gpu() else { return };
@@ -48,6 +49,7 @@ fn gpu_bakes_the_reference_scenes() {
     }
 }
 
+/// The mixed-sign reference scene on the GPU tracer
 #[test]
 #[ignore = "fails until the per-corner tangent sign fix: compute_tangents keeps one tangent per vertex, so mirrored UVs meeting at a vertex mix bitangent signs in a triangle"]
 fn gpu_mixed_tangent_signs_decode_like_the_viewport() {
