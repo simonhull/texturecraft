@@ -312,10 +312,10 @@ impl Batches<'_> {
     }
 }
 
-/// Upload `item(i)` as the `i`-th `N`-byte row of `buffer`: built and written in parallel, each
-/// thread a contiguous range of rows. wgpu's error scopes are per thread, so each write runs in a
-/// scope of its own on the thread that makes it: a failed write (out of memory, say) is an error
-/// here rather than lost to the uncaptured-error handler.
+/// Upload `item(i)` as the `i`-th `N`-byte row of `buffer`: built in parallel straight into wgpu's
+/// staging memory, each thread a contiguous range of rows. wgpu's error scopes are per thread, so
+/// each write runs in a scope of its own on the thread that makes it: a failed write (out of memory,
+/// say) is an error here rather than lost to the uncaptured-error handler.
 fn upload<const N: usize>(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -324,13 +324,17 @@ fn upload<const N: usize>(
     item: impl Fn(usize) -> Result<[u8; N], BakeError> + Sync,
 ) -> Result<(), BakeError> {
     let chunk = n.div_ceil(rayon::current_num_threads().max(1)).max(FILL_CHUNK);
-    (0..n.div_ceil(chunk)).into_par_iter().try_for_each_init(Vec::new, |bytes: &mut Vec<u8>, k| {
+    (0..n.div_ceil(chunk)).into_par_iter().try_for_each(|k| {
         let start = k.saturating_mul(chunk);
-        bytes.clear();
-        for i in start..start.saturating_add(chunk).min(n) {
-            bytes.extend_from_slice(&item(i)?);
-        }
-        scoped(device, "GPU baking: upload", || queue.write_buffer(buffer, start.saturating_mul(N) as u64, bytes)).map_err(BakeError::Tracer)
+        let rows = start..start.saturating_add(chunk).min(n);
+        let Some(size) = wgpu::BufferSize::new(rows.len().saturating_mul(N) as u64) else { return Ok(()) };
+        scoped(device, "GPU baking: upload", || {
+            // None when the write is invalid: the scope reports why
+            let Some(mut view) = queue.write_buffer_with(buffer, start.saturating_mul(N) as u64, size) else { return Ok(()) };
+            let (slots, _) = view.slice(..).into_chunks::<N>();
+            slots.into_iter().zip(rows).try_for_each(|(slot, i)| item(i).map(|row| slot.write(row)))
+        })
+        .map_err(BakeError::Tracer)?
     })
 }
 
