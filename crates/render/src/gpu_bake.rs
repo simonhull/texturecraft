@@ -281,7 +281,7 @@ impl Batches<'_> {
         let io = self.io(in_bytes, out_bytes, blocks.len() as u64)?;
         let dev = &g.device;
         scoped(dev, "GPU baking: dispatch", || {
-            upload(&g.queue, &io.items, n, item)?;
+            upload(dev, &g.queue, &io.items, n, item)?;
             g.queue.write_buffer(&io.params, 0, &blocks);
             let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_bake") });
             {
@@ -313,8 +313,11 @@ impl Batches<'_> {
 }
 
 /// Upload `item(i)` as the `i`-th `N`-byte row of `buffer`: built and written in parallel, each
-/// thread a contiguous range of rows.
+/// thread a contiguous range of rows. wgpu's error scopes are per thread, so each write runs in a
+/// scope of its own on the thread that makes it: a failed write (out of memory, say) is an error
+/// here rather than lost to the uncaptured-error handler.
 fn upload<const N: usize>(
+    device: &wgpu::Device,
     queue: &wgpu::Queue,
     buffer: &wgpu::Buffer,
     n: usize,
@@ -327,8 +330,7 @@ fn upload<const N: usize>(
         for i in start..start.saturating_add(chunk).min(n) {
             bytes.extend_from_slice(&item(i)?);
         }
-        queue.write_buffer(buffer, start.saturating_mul(N) as u64, bytes);
-        Ok(())
+        scoped(device, "GPU baking: upload", || queue.write_buffer(buffer, start.saturating_mul(N) as u64, bytes)).map_err(BakeError::Tracer)
     })
 }
 
@@ -496,6 +498,20 @@ mod tests {
             }
         }
         assert!(empty_shares > 0, "no share lost every ray: the test misses that case");
+    }
+
+    /// A write that fails while a batch uploads on worker threads is reported (wgpu's error scopes
+    /// are per thread, so the caller's scope never sees a worker's error), not silently dropped.
+    #[test]
+    fn a_failed_upload_is_an_error() {
+        let Some(baker) = gpu() else { return };
+        let g = baker.gpu().unwrap();
+        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let small = g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("tc_bake_test"), size: 256, usage, mapped_at_creation: false });
+        // Every write runs on a worker of its own pool, as in a bake, and runs past the buffer's end
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let caught = scoped(&g.device, "test upload", || pool.install(|| upload(&g.device, &g.queue, &small, 4 * FILL_CHUNK, |_| Ok([0u8; 64]))));
+        assert!(!matches!(caught, Ok(Ok(()))), "an overrunning upload was reported as written");
     }
 
     /// The GPU baker, or None (test skipped) without a hardware adapter.
