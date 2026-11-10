@@ -1393,6 +1393,30 @@ fn antialiasing_skips_ray_subsets_that_fall_entirely_below_the_surface() {
 }
 
 #[test]
+fn antialiasing_gives_a_texel_with_no_accepted_ray_the_unantialiased_value() {
+    // Shading normals lying in the face and no spread: every ray grazes the face and is rejected.
+    // Such a texel is unoccluded and as thick as the maximum ray distance with antialiasing too,
+    // not the map's display neutral (a raw thickness of 1 is an outlier for min/max normalization).
+    let m = plane(0.0, 1.0, Vec3::X);
+    let mut base = with_rays(settings(16, &[BakedMap::Thickness, BakedMap::AmbientOcclusion]), 4, 0.1);
+    base.maps.thickness.parameters.normalization = texturecraft_core::ThicknessNormalization::None;
+    for r in [&mut base.maps.ao.parameters.rays, &mut base.maps.thickness.parameters.rays] {
+        r.spread = 0.0;
+    }
+    let plain = run(&m, &base).unwrap();
+    for antialiasing in [BakeAntialiasing::Subsampling2x2, BakeAntialiasing::Subsampling8x8] {
+        let smooth = run(&m, &antialiased(base.clone(), antialiasing)).unwrap();
+        for map in [BakedMap::Thickness, BakedMap::AmbientOcclusion] {
+            let (plain, smooth) = (covered_values(&m, &plain, map), covered_values(&m, &smooth, map));
+            assert!(!plain.is_empty() && plain.len() == smooth.len());
+            for ((_, plain), (_, smooth)) in plain.iter().zip(&smooth) {
+                assert!((plain - smooth).abs() < 1e-6, "{antialiasing:?} {map:?}: {plain} without antialiasing, {smooth} with it");
+            }
+        }
+    }
+}
+
+#[test]
 fn antialiasing_keeps_bent_normals_unbiased() {
     // Subsamples that split a texel's rays each see a slice of its pattern (a band of elevations).
     // Normalizing each slice's bent normal before averaging put them 0.7-10.8 degrees off the 1x1
