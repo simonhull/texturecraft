@@ -26,7 +26,7 @@ use texturecraft_geom::{Bvh, Mesh, Surface, UvGBuffer, primitives, surface_at};
 pub type Check = fn(&dyn Tracer);
 
 /// Every check, by name, for the tracer-parameterized runners.
-pub const CHECKS: [(&str, Check); 12] = [
+pub const CHECKS: [(&str, Check); 13] = [
     ("occlusion_beside_a_wall", occlusion_beside_a_wall),
     ("occlusion_inside_an_open_box", occlusion_inside_an_open_box),
     ("height_of_a_step", height_of_a_step),
@@ -39,6 +39,7 @@ pub const CHECKS: [(&str, Check); 12] = [
     ("normal_map_round_trip_with_mirrored_uvs", normal_map_round_trip_with_mirrored_uvs),
     ("padding_fills_each_gutter_from_the_nearest_island", padding_fills_each_gutter_from_the_nearest_island),
     ("tangent_normals_agree_across_a_uv_seam", tangent_normals_agree_across_a_uv_seam),
+    ("partly_covered_texels_average_only_their_covered_subsamples", partly_covered_texels_average_only_their_covered_subsamples),
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -565,6 +566,28 @@ pub fn opacity_of_a_hole(tracer: &dyn Tracer) {
         eprintln!("opacity of a hole, {antialiasing:?}: worst error {worst:.2e}, {partial} partial texels");
         assert!(worst < 1e-6, "opacity {antialiasing:?} off by {worst}");
     }
+}
+
+/// An island whose edges sit a quarter texel inside the texel grid, so its border texels are
+/// covered by 3 of 4 subsample columns (or rows) at 4 × 4 antialiasing and its corners by 9 of
+/// 16. The world normal is +y everywhere on it, so every covered texel, partial ones included,
+/// must read exactly `pack(+y)`: a texel averages its covered subsamples, not all 16.
+pub fn partly_covered_texels_average_only_their_covered_subsamples(tracer: &dyn Tracer) {
+    const SIZE: u32 = 32;
+    // A quarter texel: between the subsample centres at 1/8 and 3/8 of a texel
+    let inset = 0.25 / SIZE as f32;
+    let low =
+        floor([-1.0, 1.0], [-1.0, 1.0], 0.0, |x, z| Vec2::new(inset + (x + 1.0) * 0.5 * (1.0 - 2.0 * inset), inset + (z + 1.0) * 0.5 * (1.0 - 2.0 * inset)));
+    let antialiasing = BakeAntialiasing::Subsampling4x4;
+    let output = bake_with(tracer, &low, None, &settings(SIZE, antialiasing, &[BakedMap::WorldNormal]));
+    let texels = texels(&low, SIZE, antialiasing);
+    let partial = texels.iter().filter(|t| t.surfaces.len() < 16).count();
+    let worst = texels.iter().map(|t| (vector(&output, BakedMap::WorldNormal, t.index) - pack(Vec3::Y)).abs().max_element()).fold(0.0, f32::max);
+    eprintln!("partly covered texels: {partial} of {}, worst error {worst:.2e}", texels.len());
+    // Every border texel of the 32 × 32 grid is partly covered
+    assert_eq!(partial, 4 * (SIZE as usize - 1), "partly covered texels");
+    // Averaging identical packed normals: exact up to single-precision rounding
+    assert!(worst < 1e-6, "partly covered texels read {worst} off the island's normal");
 }
 
 // ---------------------------------------------------------------------------------------------

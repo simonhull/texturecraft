@@ -82,6 +82,12 @@ fn tangent_normals_agree_across_a_uv_seam() {
     run("tangent_normals_agree_across_a_uv_seam");
 }
 
+/// Texels on an island's border average only the subsamples the island covers
+#[test]
+fn partly_covered_texels_average_only_their_covered_subsamples() {
+    run("partly_covered_texels_average_only_their_covered_subsamples");
+}
+
 /// The mixed-sign reference scene on the CPU tracer
 #[test]
 #[ignore = "fails until the per-corner tangent sign fix: compute_tangents keeps one tangent per vertex, so mirrored UVs meeting at a vertex mix bitangent signs in a triangle"]
