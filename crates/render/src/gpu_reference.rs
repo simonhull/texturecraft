@@ -6,37 +6,26 @@
 mod reference_scenes;
 
 use crate::gpu_bake::GpuBaker;
-use texturecraft_bake::{BakeRequest, Progress, bake_on};
-use texturecraft_core::{BakeSettings, BakedMap};
-use texturecraft_geom::{Bvh, primitives};
 
-/// The GPU baker, or None (test skipped) when a small occlusion bake falls back to the CPU.
+/// The GPU baker, or None (test skipped) when this machine has no hardware adapter. The adapter
+/// is requested as `GpuBaker` requests it (high performance, software renderers refused). Only
+/// its absence skips: with an adapter, any GPU bake error, a WGSL compile error in `bake.wgsl`
+/// included, makes the bake fall back to the CPU, which `bake_with` reports as a failure.
 fn gpu() -> Option<GpuBaker> {
-    let gpu = GpuBaker::new();
-    let mesh = primitives::cube(2.0);
-    let bvh = Bvh::new(&mesh);
-    let mut settings = BakeSettings::default();
-    settings.common.resolution = texturecraft_core::BakeResolution::R32;
-    settings.maps.select([BakedMap::AmbientOcclusion]);
-    let request = BakeRequest {
-        low_base_color: &[],
-        mesh: &mesh,
-        bvh: &bvh,
-        material: 0,
-        settings: &settings,
-        high: None,
-        cage: None,
-        skew: None,
-        cage_paint: None,
-        tiles: (1, 1),
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let options = wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() };
+    let info = match pollster::block_on(instance.request_adapter(&options)) {
+        Ok(adapter) => adapter.get_info(),
+        Err(error) => {
+            eprintln!("skipping: no GPU adapter: {error}");
+            return None;
+        }
     };
-    let tracer = bake_on(&request, &Progress::new(), &gpu).ok()?.tracer;
-    if tracer.starts_with("GPU") {
-        Some(gpu)
-    } else {
-        eprintln!("skipping: {tracer}");
-        None
+    if info.device_type == wgpu::DeviceType::Cpu {
+        eprintln!("skipping: {} is a software renderer", info.name);
+        return None;
     }
+    Some(GpuBaker::new())
 }
 
 /// Every reference scene on the GPU tracer (skipped without an adapter)
