@@ -301,6 +301,16 @@ impl GpuScene<'_> {
     }
 }
 
+/// Threads per query and queries per dispatch of a hemisphere pass of `rays` rays per texel, for
+/// queries that split their texel's rays into between `fewest` and `most` subsets. A query's rays
+/// spread over `lanes` threads of a workgroup (a power of two), sized for the usual full texel's
+/// share; a dispatch holds as many queries as keep it under RAYS_PER_DISPATCH even if they all cast
+/// the largest share (an edge texel with few covered subsamples casts more rays per query).
+fn hemisphere_sizes(rays: u32, (fewest, most): (u32, u32)) -> (u32, usize) {
+    let lanes = rays.div_ceil(most.max(1)).clamp(1, WORKGROUP).next_power_of_two();
+    (lanes, RAYS_PER_DISPATCH / rays.div_ceil(fewest.max(1)).max(1) as usize)
+}
+
 /// A row of `v` (as bits) and `w`.
 fn row(v: Vec3, w: u32) -> [u32; 4] {
     [v.x.to_bits(), v.y.to_bits(), v.z.to_bits(), w]
@@ -329,14 +339,15 @@ impl RayScene for GpuScene<'_> {
             })
             .collect::<Result<Vec<_>, BakeError>>()?
             .concat();
-        // Antialiased texels split their rays between subsamples: size the lanes for a full texel's share.
+        // Antialiased texels split their rays between subsamples: size the lanes for a full texel's share,
+        // and the dispatches for the largest share (an edge texel's few subsamples cast more rays each),
+        // so that no dispatch casts more than RAYS_PER_DISPATCH rays.
         let subsets = queries.par_iter().map(|q| q.subsets).max().unwrap_or(1).max(1);
+        let fewest_subsets = queries.par_iter().map(|q| q.subsets).min().unwrap_or(1).max(1);
         let passes: Vec<Pass> = passes
             .iter()
             .map(|h| {
-                // A query's rays spread over `lanes` threads of a workgroup (a power of two).
-                let rays = h.rays.div_ceil(subsets);
-                let lanes = rays.clamp(1, WORKGROUP).next_power_of_two();
+                let (lanes, per_dispatch) = hemisphere_sizes(h.rays, (fewest_subsets, subsets));
                 let flags =
                     [(h.uniform, UNIFORM), (h.ground_height.is_some(), 8), (h.same_key, SAME_KEY)].iter().filter(|(on, _)| *on).fold(0, |f, (_, b)| f | b);
                 let params = Params {
@@ -362,7 +373,7 @@ impl RayScene for GpuScene<'_> {
                     lanes,
                     ..Params::default()
                 };
-                Pass { params, per_dispatch: RAYS_PER_DISPATCH / rays.max(1) as usize, per_group: (WORKGROUP / lanes) as usize }
+                Pass { params, per_dispatch, per_group: (WORKGROUP / lanes) as usize }
             })
             .collect();
         let gpu = self.gpu;
@@ -385,6 +396,22 @@ mod tests {
     use texturecraft_geom::{Bvh, Mesh, primitives};
 
     use super::*;
+
+    /// However a batch mixes fully and partly covered antialiased texels, no hemisphere dispatch casts
+    /// more than RAYS_PER_DISPATCH rays (the driver-watchdog bound), and unsplit queries are sized as
+    /// before rays were split.
+    #[test]
+    fn hemisphere_dispatches_stay_under_the_ray_budget() {
+        for rays in [1, 7, 64, 1000, 4096] {
+            for (fewest, most) in [(1, 1), (1, 4), (1, 64), (3, 16), (64, 64)] {
+                let (lanes, per_dispatch) = hemisphere_sizes(rays, (fewest, most));
+                assert!(lanes.is_power_of_two() && lanes <= WORKGROUP, "{rays} rays, {fewest}..{most} subsets: {lanes} lanes");
+                let worst = per_dispatch * rays.div_ceil(fewest) as usize;
+                assert!(worst <= RAYS_PER_DISPATCH, "{rays} rays, {fewest}..{most} subsets: up to {worst} rays per dispatch");
+            }
+            assert_eq!(hemisphere_sizes(rays, (1, 1)), (rays.clamp(1, WORKGROUP).next_power_of_two(), RAYS_PER_DISPATCH / rays as usize));
+        }
+    }
 
     /// The GPU baker, or None (test skipped) without a hardware adapter.
     fn gpu() -> Option<GpuBaker> {
