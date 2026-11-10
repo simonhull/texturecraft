@@ -413,6 +413,61 @@ mod tests {
         }
     }
 
+    /// Query by query, the GPU tracer returns what the CPU tracer does for every share of a texel's
+    /// rays (a query casts rays subset, subset + subsets, …), whole texels mixed into the same batch.
+    /// A bake-level comparison averages shares away; this catches a shader that walks the wrong rays.
+    #[test]
+    fn gpu_hemisphere_queries_match_the_cpu_share_by_share() {
+        use texturecraft_bake::tracing::{ANY, CpuTracer, Hemisphere, Query, RayKind, TraceMesh, Tracer};
+        let Some(baker) = gpu() else { return };
+        let ball = primitives::material_ball();
+        let bvh = Bvh::new(&ball);
+        let meshes = [TraceMesh { mesh: &ball, bvh: &bvh, keys: &[], backface_culling: &[] }];
+        let pass = |kind, rays| Hemisphere {
+            kind,
+            rays,
+            dmax: 0.5,
+            min_distance: 1e-5,
+            attenuation: AmbientOcclusionAttenuation::Linear,
+            ground_height: None,
+            eps: 1e-4,
+            cos_max: 0.0,
+            sin_max: 1.0,
+            uniform: false,
+            ignore_backface: BackfaceMode::Never,
+            same_key: false,
+        };
+        let passes = [pass(RayKind::Occlusion, 64), pass(RayKind::Thickness, 16)];
+        // Triangle centres; every other one leans its shading normal so that some shares lose every ray
+        let queries: Vec<Query> = (0..ball.triangle_count())
+            .step_by(211)
+            .filter_map(|t| ball.tri(t).map(|corners| corners.map(|v| ball.positions.get(v).copied().unwrap_or_default())))
+            .enumerate()
+            .flat_map(|(i, [a, b, c])| {
+                let geo = (b - a).cross(c - a).normalize_or_zero();
+                let nrm = if i % 2 == 0 { geo } else { (geo + 1.5 * (b - a).normalize_or_zero()).normalize_or_zero() };
+                let rot = [(i as f32 * 0.618_034).fract(), (i as f32 * 0.414_214).fract()];
+                let query = |(subset, subsets)| Query { pos: (a + b + c) / 3.0, nrm, geo, rot, key: ANY, mesh: 0, subset, subsets };
+                [1u32, 3, 4, 16, 64].into_iter().flat_map(|subsets| (0..subsets).map(move |subset| (subset, subsets))).map(query).collect::<Vec<_>>()
+            })
+            .collect();
+        let cpu = CpuTracer.scene(&meshes).unwrap().hemispheres(&passes, &queries).unwrap();
+        let gpu = baker.scene(&meshes).unwrap().hemispheres(&passes, &queries).unwrap();
+        assert_eq!((cpu.len(), gpu.len()), (passes.len(), passes.len()));
+        let mut empty_shares = 0;
+        for ((pass, cpu), gpu) in passes.iter().zip(&cpu).zip(&gpu) {
+            assert_eq!((cpu.len(), gpu.len()), (queries.len(), queries.len()));
+            for ((query, cpu), gpu) in queries.iter().zip(cpu).zip(gpu) {
+                for (c, g) in cpu.iter().zip(gpu) {
+                    let agree = if c.is_nan() { g.is_nan() } else { (c - g).abs() <= 1e-4 * c.abs().max(1.0) };
+                    assert!(agree, "{:?} share {} of {}: CPU {cpu:?}, GPU {gpu:?}", pass.kind, query.subset, query.subsets);
+                }
+                empty_shares += usize::from(cpu[0].is_nan());
+            }
+        }
+        assert!(empty_shares > 0, "no share lost every ray: the test misses that case");
+    }
+
     /// The GPU baker, or None (test skipped) without a hardware adapter.
     fn gpu() -> Option<GpuBaker> {
         let g = GpuBaker::new();
