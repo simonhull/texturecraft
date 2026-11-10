@@ -404,22 +404,27 @@ fn bake_rows(
     let (occlusion_results, separate_bent_results, thickness) =
         (next(context.ao.is_some()), next(separate_bent_pass.is_some()), next(context.thickness.is_some()));
     let bent_results = if separate_bent_pass.is_some() { &separate_bent_results } else { &occlusion_results };
+    // What a thickness query with no accepted ray reports (Hemisphere::evaluate)
+    let thickness_dmax = context.thickness.map_or(1.0, |pass| pass.dmax);
 
     rows.par_iter_mut().zip(&samples_by_row).zip(&row_offsets).for_each(|((row, samples), &first)| {
         let mut sample_values = [[0.0f32; 3]; BakedMap::ALL.len()];
         let mut row_sample_index = 0;
         for x in 0..width {
             let texel_samples = samples.get(row_sample_index..).unwrap_or_default().iter().take_while(|sample| sample.x == x).count();
-            let bent = texel_bent_normal(bent_results, first + row_sample_index..first + row_sample_index + texel_samples);
+            let texel = first + row_sample_index..first + row_sample_index + texel_samples;
+            let bent = texel_bent_normal(bent_results, texel.clone());
+            // A split texel none of whose rays was accepted reports what one query with no accepted ray does
+            let (ao_unset, thickness_unset) = (no_accepted_ray(&occlusion_results, texel.clone()), no_accepted_ray(&thickness, texel));
             // Per map: a subsample without a finite value (a ray subset with no accepted ray) is skipped
             let mut accumulated = [[0.0f32; 3]; BakedMap::ALL.len()];
             let mut counts = [0u32; BakedMap::ALL.len()];
             while let Some(sample) = samples.get(row_sample_index).filter(|sample| sample.x == x) {
                 let sample_index = first + row_sample_index;
                 let traced = map::Traced {
-                    ao: occlusion_results.get(sample_index).map_or(1.0, |value| value[0]),
+                    ao: occlusion_results.get(sample_index).map_or(1.0, |value| if ao_unset { 1.0 } else { value[0] }),
                     bent,
-                    thickness: thickness.get(sample_index).map_or(1.0, |value| value[0]),
+                    thickness: thickness.get(sample_index).map_or(1.0, |value| if thickness_unset { thickness_dmax } else { value[0] }),
                     curvature: curvature.get(sample_index).copied().unwrap_or(0.5),
                 };
                 context.evaluate(maps, &sample.surface, sample.bary, transfer(sample_index), &traced, &mut sample_values);
@@ -443,6 +448,14 @@ fn bake_rows(
         }
     });
     Ok(())
+}
+
+/// Whether the texel whose subsamples have these hemisphere results split its rays and none of them
+/// was accepted (every subset reported NaN). Such a texel takes the value a single query with no
+/// accepted ray gives (unoccluded, or the maximum ray distance), as it would without antialiasing,
+/// rather than the map's display neutral. A texel traced as one query never reports NaN.
+fn no_accepted_ray(results: &[[f32; 4]], texel: std::ops::Range<usize>) -> bool {
+    results.get(texel).is_some_and(|values| values.len() > 1 && values.iter().all(|value| value[0].is_nan()))
 }
 
 /// The bent normal of the texel whose subsamples have these hemisphere results. A texel traced as one
