@@ -194,7 +194,7 @@ impl Mesh {
         let mut g = Mikk { mesh: self, corners: vec![None; self.indices.len()] };
         if usable && mikktspace::generate_tangents(&mut g) {
             let mut corners = g.corners;
-            for triangle in corners.chunks_exact_mut(3) {
+            for triangle in corners.as_chunks_mut::<3>().0 {
                 if let Some(Some(first)) = triangle.first().copied() {
                     triangle.iter_mut().flatten().for_each(|t| t.w = first.w);
                 }
@@ -493,12 +493,12 @@ mod tests {
             let corners = mikktspace_corners(&unsplit);
             let shared = || unsplit.indices.iter().zip(&corners);
             let vertex_needs_two_signs = shared().any(|(v, t)| shared().any(|(u, s)| u == v && s.w != t.w));
-            let triangle_mixes_signs = corners.chunks_exact(3).any(|c| c.iter().any(|t| t.w != c[0].w));
+            let triangle_mixes_signs = corners.as_chunks::<3>().0.iter().any(|c| c.iter().any(|t| t.w != c[0].w));
             assert!(vertex_needs_two_signs || triangle_mixes_signs, "{name}: one tangent per vertex would mix signs in a triangle");
             let mut m = unsplit.clone();
             m.compute_tangents();
             m.validate().unwrap();
-            for (t, (tri, wanted)) in m.indices.chunks_exact(3).zip(corners.chunks_exact(3)).enumerate() {
+            for (t, (tri, wanted)) in m.indices.as_chunks::<3>().0.iter().zip(corners.as_chunks::<3>().0).enumerate() {
                 let w = tri.iter().map(|v| m.tangents[*v as usize].w).collect::<Vec<_>>();
                 assert!(w.iter().all(|sign| Some(sign) == w.first()), "{name}: triangle {t} mixes bitangent signs {w:?}");
                 let [a, b, c] = unsplit.tri(t).unwrap().map(|v| unsplit.positions[v]);
